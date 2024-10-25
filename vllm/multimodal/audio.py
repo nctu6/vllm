@@ -3,11 +3,12 @@ from typing import Dict, Tuple, Type, Union
 import torch
 import numpy as np
 from vllm.config import ModelConfig, WhisperConfig
+from vllm.inputs.registry import InputContext
 from vllm.logger import init_logger
 from vllm.sequence import SequenceData
 from vllm.transformers_utils.whisper_processor import cached_get_whisper_processor
 
-from .base import MultiModalData, MultiModalPlugin
+from vllm.multimodal.base import MultiModalInputs, MultiModalPlugin
 
 logger = init_logger(__name__)
 
@@ -82,3 +83,12 @@ class AudioPlugin(MultiModalPlugin[AudioData]):
         except Exception:
             logger.error("Failed to process audio (%s)", audio)
             raise
+
+
+    def _default_input_mapper(self, ctx: InputContext, data: object,
+                              **mm_processor_kwargs) -> MultiModalInputs:
+        raise NotImplementedError("There is no default audio input mapper")
+
+    def _default_max_multimodal_tokens(self, ctx: InputContext) -> int:
+        raise NotImplementedError(
+            "There is no default maximum multimodal tokens")
