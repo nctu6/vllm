@@ -1177,3 +1177,16 @@ class LoRAConfig:
         if scheduler_config.chunked_prefill_enabled:
             raise ValueError("LoRA is not supported with chunked prefill yet.")
 
+
+@dataclass
+class MultiModalConfig:
+    """Controls the behavior of multimodal models."""
+
+    limit_per_prompt: Mapping[str, int] = field(default_factory=dict)
+    """
+    The maximum number of multi-modal input instances allowed per prompt
+    for each :class:`~vllm.multimodal.MultiModalPlugin`.
+    """
+
+    # TODO: Add configs to init vision tower or not.
+
