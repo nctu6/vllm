@@ -5,11 +5,28 @@ from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Mapping,
                     Optional, Tuple, Type, Union)
 
 import torch
+from transformers import PretrainedConfig
+
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
+from vllm.model_executor.models import ModelRegistry
+from vllm.platforms import current_platform
+from vllm.tracing import is_otel_available, otel_import_error_traceback
 from vllm.transformers_utils.config import (ConfigFormat, get_config,
                                             get_hf_image_processor_config,
                                             get_hf_text_config)
+from vllm.utils import (GiB_bytes, cuda_device_count_stateless, get_cpu_memory,
+                        is_hip, is_neuron, is_openvino, is_xpu,
+                        print_warning_once)
+
+if TYPE_CHECKING:
+    from ray.util.placement_group import PlacementGroup
+
+    from vllm.executor.executor_base import ExecutorBase
+    from vllm.model_executor.model_loader.loader import BaseModelLoader
+    from vllm.transformers_utils.tokenizer_group.base_tokenizer_group import (
+        BaseTokenizerGroup)
 
 logger = init_logger(__name__)
 
@@ -17,7 +34,6 @@ _GB = 1 << 30
 _EMBEDDING_MODEL_MAX_NUM_BATCHED_TOKENS = 32768
 _WHISPER_MAX_NUM_BATCHED_TOKENS = 448
 _MULTIMODAL_MODEL_MAX_NUM_BATCHED_TOKENS = 5120
-
 
 class ModelConfig:
     """Configuration for the model.
@@ -666,42 +682,6 @@ class CacheConfig:
             logger.warning("Possibly too large swap space. %s", msg)
 
 
-class DeviceConfig:
-    device: Optional[torch.device]
-
-    def __init__(self, device: str = "auto") -> None:
-        if device == "auto":
-            # Automated device type detection
-            if current_platform.is_cuda_alike():
-                self.device_type = "cuda"
-            elif is_neuron():
-                self.device_type = "neuron"
-            elif current_platform.is_hpu():
-                self.device_type = "hpu"
-            elif is_openvino():
-                self.device_type = "openvino"
-            elif current_platform.is_tpu():
-                self.device_type = "tpu"
-            elif current_platform.is_cpu():
-                self.device_type = "cpu"
-            elif is_xpu():
-                self.device_type = "xpu"
-            else:
-                raise RuntimeError("Failed to infer device type")
-        else:
-            # Device type is assigned explicitly
-            self.device_type = device
-
-        # Some device types require processing inputs on CPU
-        if self.device_type in ["neuron", "openvino"]:
-            self.device = torch.device("cpu")
-        elif self.device_type in ["tpu"]:
-            self.device = None
-        else:
-            # Set device with device type
-            self.device = torch.device(self.device_type)
-
-
 @dataclass
 class TokenizerPoolConfig:
     """Configuration for the tokenizer pool.
@@ -1125,6 +1105,464 @@ class SchedulerConfig:
         return self.num_scheduler_steps > 1
 
 
+class DeviceConfig:
+    device: Optional[torch.device]
+
+    def __init__(self, device: str = "auto") -> None:
+        if device == "auto":
+            # Automated device type detection
+            if current_platform.is_cuda_alike():
+                self.device_type = "cuda"
+            elif is_neuron():
+                self.device_type = "neuron"
+            elif current_platform.is_hpu():
+                self.device_type = "hpu"
+            elif is_openvino():
+                self.device_type = "openvino"
+            elif current_platform.is_tpu():
+                self.device_type = "tpu"
+            elif current_platform.is_cpu():
+                self.device_type = "cpu"
+            elif is_xpu():
+                self.device_type = "xpu"
+            else:
+                raise RuntimeError("Failed to infer device type")
+        else:
+            # Device type is assigned explicitly
+            self.device_type = device
+
+        # Some device types require processing inputs on CPU
+        if self.device_type in ["neuron", "openvino"]:
+            self.device = torch.device("cpu")
+        elif self.device_type in ["tpu"]:
+            self.device = None
+        else:
+            # Set device with device type
+            self.device = torch.device(self.device_type)
+
+
+class SpeculativeConfig:
+    """Configuration for speculative decoding.
+
+    The configuration is currently specialized to draft-model speculative
+    decoding with top-1 proposals.
+    """
+
+    @staticmethod
+    def maybe_create_spec_config(
+        target_model_config: ModelConfig,
+        target_parallel_config: ParallelConfig,
+        target_dtype: str,
+        speculative_model: Optional[str],
+        speculative_model_quantization: Optional[str],
+        speculative_draft_tensor_parallel_size: Optional[int],
+        num_speculative_tokens: Optional[int],
+        speculative_disable_mqa_scorer: Optional[bool],
+        speculative_max_model_len: Optional[int],
+        enable_chunked_prefill: bool,
+        use_v2_block_manager: bool,
+        disable_log_stats: bool,
+        speculative_disable_by_batch_size: Optional[int],
+        ngram_prompt_lookup_max: Optional[int],
+        ngram_prompt_lookup_min: Optional[int],
+        draft_token_acceptance_method: str,
+        typical_acceptance_sampler_posterior_threshold: Optional[float],
+        typical_acceptance_sampler_posterior_alpha: Optional[float],
+        disable_logprobs: Optional[bool],
+    ) -> Optional["SpeculativeConfig"]:
+        """Create a SpeculativeConfig if possible, else return None.
+
+        This function attempts to create a SpeculativeConfig object based on the
+        provided parameters. If the necessary conditions are met, it returns an
+        instance of SpeculativeConfig. Otherwise, it returns None.
+
+        Args:
+            target_model_config (ModelConfig): The configuration of the target
+                model.
+            target_parallel_config (ParallelConfig): The parallel configuration
+                for the target model.
+            target_dtype (str): The data type used for the target model.
+            speculative_model (Optional[str]): The name of the speculative
+                model, if provided.
+            speculative_model_quantization (Optional[str]): Quantization method
+                that was used to quantize the speculative model weights. If
+                None, we assume the model weights are not quantized.
+            speculative_draft_tensor_parallel_size (Optional[int]): The degree
+                of the tensor parallelism for the draft model.
+            num_speculative_tokens (Optional[int]): The number of speculative
+                tokens, if provided. Will default to the number in the draft
+                model config if present, otherwise is required.
+            speculative_disable_mqa_scorer (Optional[bool]): Disable the MQA
+                scorer for the speculative model and fall back to batch
+                expansion for scoring.
+            speculative_max_model_len (Optional[int]): The maximum model len of
+                the speculative model. Used when testing the ability to skip
+                speculation for some sequences.
+            enable_chunked_prefill (bool): Whether vLLM is configured to use
+                chunked prefill or not. Used for raising an error since its not
+                yet compatible with spec decode.
+            use_v2_block_manager (bool): Whether vLLM is configured to use the
+                v2 block manager or not. Used for raising an error since the v2
+                block manager is required with spec decode.
+            speculative_disable_by_batch_size (Optional[int]): Disable
+                speculative decoding for new incoming requests when the number
+                of enqueue requests  is larger than this value, if provided.
+            ngram_prompt_lookup_max (Optional[int]): Max size of ngram token
+                window, if provided.
+            ngram_prompt_lookup_min (Optional[int]): Min size of ngram token
+                window, if provided.
+            draft_token_acceptance_method (str): The method to use for
+                accepting draft tokens. This can take two possible
+                values 'rejection_sampler' and 'typical_acceptance_sampler'
+                for RejectionSampler and TypicalAcceptanceSampler
+                respectively.
+            typical_acceptance_sampler_posterior_threshold (Optional[float]):
+                A threshold value that sets a lower bound on the posterior
+                probability of a token in the target model for it to be
+                accepted. This threshold is used only when we use the
+                TypicalAcceptanceSampler for token acceptance.
+            typical_acceptance_sampler_posterior_alpha (Optional[float]):
+                A scaling factor for the entropy-based threshold in the
+                TypicalAcceptanceSampler.
+            disable_logprobs (Optional[bool]): If set to True, token log
+                probabilities are not returned during speculative decoding.
+                If set to False, token log probabilities are returned
+                according to the log probability settings in SamplingParams.
+                If not specified, it defaults to True.
+
+        Returns:
+            Optional["SpeculativeConfig"]: An instance of SpeculativeConfig if
+                the necessary conditions are met, else None.
+        """
+
+        if speculative_model is None:
+            if num_speculative_tokens is not None:
+                raise ValueError("num_speculative_tokens was provided without "
+                                 "speculative_model.")
+            return None
+
+        if (speculative_disable_by_batch_size is not None
+                and speculative_disable_by_batch_size < 2):
+            raise ValueError("Expect the batch size threshold of disabling "
+                             "speculative decoding is > 1, but got "
+                             f"{speculative_disable_by_batch_size=}")
+
+        # Reminder: Please update docs/source/serving/compatibility_matrix.rst
+        # If the feature combo become valid
+        if enable_chunked_prefill:
+            raise ValueError(
+                "Speculative decoding and chunked prefill are "
+                f"currently mutually exclusive ({enable_chunked_prefill=}).")
+
+        if not use_v2_block_manager:
+            raise ValueError(
+                "Speculative decoding requires usage of the V2 "
+                "block manager. Enable it with --use-v2-block-manager.")
+
+        # TODO: The user should be able to specify revision/max model len
+        # for the draft model. It is not currently supported.
+        draft_revision = None
+        draft_code_revision = None
+        draft_quantization = speculative_model_quantization
+
+        if speculative_model == "[ngram]":
+            if ngram_prompt_lookup_min is None:
+                ngram_prompt_lookup_min = 1
+            if ngram_prompt_lookup_max is None or ngram_prompt_lookup_max < 1:
+                raise ValueError(f"{ngram_prompt_lookup_max=} must be > 0")
+            if ngram_prompt_lookup_min < 1:
+                raise ValueError(f"{ngram_prompt_lookup_min=} must be > 0")
+            if ngram_prompt_lookup_min > ngram_prompt_lookup_max:
+                raise ValueError(f"{ngram_prompt_lookup_min=} cannot be "
+                                 f"larger than {ngram_prompt_lookup_max=}")
+
+            # TODO: current we still need extract vocab_size from target model
+            # config, in future, we may try refactor it out, and set
+            # draft related config as None here.
+            draft_model_config = target_model_config
+            draft_parallel_config = target_parallel_config
+        else:
+            ngram_prompt_lookup_max = 0
+            ngram_prompt_lookup_min = 0
+            draft_model_config = ModelConfig(
+                model=speculative_model,
+                tokenizer=target_model_config.tokenizer,
+                tokenizer_mode=target_model_config.tokenizer_mode,
+                trust_remote_code=target_model_config.trust_remote_code,
+                dtype=target_model_config.dtype,
+                seed=target_model_config.seed,
+                revision=draft_revision,
+                code_revision=draft_code_revision,
+                tokenizer_revision=target_model_config.tokenizer_revision,
+                max_model_len=None,
+                spec_target_max_model_len=target_model_config.max_model_len,
+                quantization=draft_quantization,
+                enforce_eager=target_model_config.enforce_eager,
+                max_seq_len_to_capture=target_model_config.
+                max_seq_len_to_capture,
+                max_logprobs=target_model_config.max_logprobs,
+            )
+
+            draft_hf_config = draft_model_config.hf_config
+
+            if (num_speculative_tokens is not None
+                    and hasattr(draft_hf_config, "num_lookahead_tokens")):
+                draft_hf_config.num_lookahead_tokens = num_speculative_tokens
+
+            n_predict = getattr(draft_hf_config, "n_predict", None)
+            if n_predict is not None:
+                if num_speculative_tokens is None:
+                    # Default to max value defined in draft model config.
+                    num_speculative_tokens = n_predict
+                elif num_speculative_tokens > n_predict:
+                    # Verify provided value doesn't exceed the maximum
+                    # supported by the draft model.
+                    raise ValueError(
+                        "This speculative model supports a maximum of "
+                        f"num_speculative_tokens={n_predict}, but "
+                        f"{num_speculative_tokens=} was provided.")
+
+            draft_model_config.max_model_len = (
+                SpeculativeConfig._maybe_override_draft_max_model_len(
+                    speculative_max_model_len,
+                    draft_model_config.max_model_len,
+                    target_model_config.max_model_len,
+                ))
+
+            draft_parallel_config = (
+                SpeculativeConfig.create_draft_parallel_config(
+                    target_parallel_config,
+                    speculative_draft_tensor_parallel_size, draft_hf_config))
+
+        if num_speculative_tokens is None:
+            raise ValueError(
+                "num_speculative_tokens must be provided with "
+                "speculative_model unless the draft model config contains an "
+                "n_predict parameter.")
+
+        if typical_acceptance_sampler_posterior_threshold is None:
+            typical_acceptance_sampler_posterior_threshold = 0.09
+        if typical_acceptance_sampler_posterior_alpha is None:
+            typical_acceptance_sampler_posterior_alpha = 0.3
+        if disable_logprobs is None:
+            disable_logprobs = True
+
+        return SpeculativeConfig(
+            draft_model_config,
+            draft_parallel_config,
+            num_speculative_tokens,
+            speculative_disable_mqa_scorer,
+            speculative_disable_by_batch_size,
+            ngram_prompt_lookup_max,
+            ngram_prompt_lookup_min,
+            draft_token_acceptance_method=draft_token_acceptance_method,
+            typical_acceptance_sampler_posterior_threshold=\
+                typical_acceptance_sampler_posterior_threshold,
+            typical_acceptance_sampler_posterior_alpha=\
+                typical_acceptance_sampler_posterior_alpha,
+            disable_logprobs=disable_logprobs,
+            disable_log_stats=disable_log_stats,
+        )
+
+    @staticmethod
+    def _maybe_override_draft_max_model_len(
+        speculative_max_model_len: Optional[int],
+        draft_max_model_len: int,
+        target_max_model_len: int,
+    ) -> int:
+        """Determine the max sequence len for the draft model. This is usually
+        the draft_max_model_len, but may be the target_max_model_len if it is
+        less than the draft_max_model_len, or may be speculative_max_model_len
+        if it is specified.
+
+        This is necessary so that sequences do not exceed the capacity of the
+        draft model or the target model.
+
+        speculative_max_model_len is mainly used for testing that sequences can
+        skip speculation.
+        """
+
+        if speculative_max_model_len is not None:
+
+            if speculative_max_model_len > draft_max_model_len:
+                raise ValueError(f"{speculative_max_model_len=} cannot be "
+                                 f"larger than {draft_max_model_len=}")
+
+            if speculative_max_model_len > target_max_model_len:
+                raise ValueError(f"{speculative_max_model_len=} cannot be "
+                                 f"larger than {target_max_model_len=}")
+
+            return speculative_max_model_len
+
+        return min(
+            draft_max_model_len,
+            target_max_model_len,
+        )
+
+    @staticmethod
+    def create_draft_parallel_config(
+        target_parallel_config: ParallelConfig,
+        speculative_draft_tensor_parallel_size: Optional[int],
+        draft_hf_config: PretrainedConfig,
+    ) -> ParallelConfig:
+        """Create a parallel config for use by the draft worker.
+
+        This is mostly a copy of the target parallel config, except the tp_size.
+        """
+        if speculative_draft_tensor_parallel_size is None:
+            if draft_hf_config.model_type == "mlp_speculator":
+                speculative_draft_tensor_parallel_size = 1
+                if target_parallel_config.tensor_parallel_size > 1:
+                    logger.warning(
+                        "MLPSpeculator cannot currently be run with tp>1; "
+                        "setting speculative_draft_tensor_parallel_size=1")
+            else:
+                speculative_draft_tensor_parallel_size = \
+                    target_parallel_config.tensor_parallel_size
+        elif speculative_draft_tensor_parallel_size != 1:
+            # TODO(wooyeon): allow tp values larger than 1
+            raise ValueError(
+                f"{speculative_draft_tensor_parallel_size=} cannot be "
+                f"other value than 1")
+
+        draft_parallel_config = ParallelConfig(
+            pipeline_parallel_size=target_parallel_config.
+            pipeline_parallel_size,
+            tensor_parallel_size=speculative_draft_tensor_parallel_size,
+            distributed_executor_backend=target_parallel_config.
+            distributed_executor_backend,
+            max_parallel_loading_workers=target_parallel_config.
+            max_parallel_loading_workers,
+            disable_custom_all_reduce=target_parallel_config.
+            disable_custom_all_reduce,
+            tokenizer_pool_config=target_parallel_config.tokenizer_pool_config,
+            ray_workers_use_nsight=target_parallel_config.
+            ray_workers_use_nsight,
+            placement_group=target_parallel_config.placement_group,
+        )
+
+        return draft_parallel_config
+
+    def __init__(
+        self,
+        draft_model_config: ModelConfig,
+        draft_parallel_config: ParallelConfig,
+        num_speculative_tokens: int,
+        speculative_disable_mqa_scorer: Optional[bool],
+        speculative_disable_by_batch_size: Optional[int],
+        ngram_prompt_lookup_max: Optional[int],
+        ngram_prompt_lookup_min: Optional[int],
+        draft_token_acceptance_method: str,
+        typical_acceptance_sampler_posterior_threshold: float,
+        typical_acceptance_sampler_posterior_alpha: float,
+        disable_logprobs: bool,
+        disable_log_stats: bool,
+    ):
+        """Create a SpeculativeConfig object.
+
+        Args:
+            draft_model_config: ModelConfig for the draft model.
+            draft_parallel_config: ParallelConfig for the draft model.
+            num_speculative_tokens: The number of tokens to sample from the
+                draft model before scoring with the target model.
+            speculative_disable_by_batch_size: Disable speculative
+                decoding for new incoming requests when the number of
+                enqueue requests is larger than this value.
+            ngram_prompt_lookup_max: Max size of ngram token window.
+            ngram_prompt_lookup_min: Min size of ngram token window.
+            draft_token_acceptance_method (str): The method to use for
+                accepting draft tokens. This can take two possible
+                values 'rejection_sampler' and 'typical_acceptance_sampler'
+                for RejectionSampler and TypicalAcceptanceSampler
+                respectively.
+            typical_acceptance_sampler_posterior_threshold (Optional[float]):
+                A threshold value that sets a lower bound on the posterior
+                probability of a token in the target model for it to be
+                accepted. This threshold is used only when we use the
+                TypicalAcceptanceSampler for token acceptance.
+            typical_acceptance_sampler_posterior_alpha (Optional[float]):
+                A scaling factor for the entropy-based threshold in the
+                TypicalAcceptanceSampler.
+            disable_logprobs: If set to True, token log probabilities will not
+                be returned even if requested by sampling parameters. This
+                reduces latency by skipping logprob calculation in proposal
+                sampling, target sampling, and after accepted tokens are
+                determined. If set to False, log probabilities will be
+                returned.
+            disable_log_stats: Whether to disable periodic printing of stage
+                times in speculative decoding.
+        """
+        self.draft_model_config = draft_model_config
+        self.draft_parallel_config = draft_parallel_config
+        self.num_speculative_tokens = num_speculative_tokens
+        self.speculative_disable_mqa_scorer = speculative_disable_mqa_scorer
+        self.speculative_disable_by_batch_size = \
+            speculative_disable_by_batch_size
+        self.ngram_prompt_lookup_max = ngram_prompt_lookup_max or 0
+        self.ngram_prompt_lookup_min = ngram_prompt_lookup_min or 0
+        self.draft_token_acceptance_method = draft_token_acceptance_method
+        self.typical_acceptance_sampler_posterior_threshold = \
+            typical_acceptance_sampler_posterior_threshold
+        self.typical_acceptance_sampler_posterior_alpha = \
+            typical_acceptance_sampler_posterior_alpha
+        self.disable_logprobs = disable_logprobs
+        self.disable_log_stats = disable_log_stats
+
+        self._verify_args()
+
+    def _verify_args(self) -> None:
+        if self.num_speculative_tokens <= 0:
+            raise ValueError("Expected num_speculative_tokens to be greater "
+                             f"than zero ({self.num_speculative_tokens}).")
+
+        if self.draft_model_config:
+            self.draft_model_config.verify_with_parallel_config(
+                self.draft_parallel_config)
+            # Validate and set draft token acceptance related settings.
+
+        if (self.draft_token_acceptance_method is None):
+            raise ValueError("draft_token_acceptance_method is not set. "
+                             "Expected values are rejection_sampler or "
+                             "typical_acceptance_sampler.")
+
+        if (self.draft_token_acceptance_method != 'rejection_sampler'
+                and self.draft_token_acceptance_method !=
+                'typical_acceptance_sampler'):
+            raise ValueError(
+                "Expected draft_token_acceptance_method to be either "
+                "rejection_sampler or typical_acceptance_sampler. Instead it "
+                f"is {self.draft_token_acceptance_method}")
+
+        if (self.typical_acceptance_sampler_posterior_threshold < 0
+                or self.typical_acceptance_sampler_posterior_alpha < 0):
+            raise ValueError(
+                "Expected typical_acceptance_sampler_posterior_threshold "
+                "and typical_acceptance_sampler_posterior_alpha to be > 0. "
+                "Instead found "
+                f"typical_acceptance_sampler_posterior_threshold = "
+                f"{self.typical_acceptance_sampler_posterior_threshold} and "
+                f"typical_acceptance_sampler_posterior_alpha = "
+                f"{self.typical_acceptance_sampler_posterior_alpha}")
+
+    @property
+    def num_lookahead_slots(self) -> int:
+        """The number of additional slots the scheduler should allocate per
+        step, in addition to the slots allocated for each known token.
+
+        This is equal to the number of speculative tokens, as each speculative
+        token must be scored.
+        """
+        return self.num_speculative_tokens
+
+    def __repr__(self) -> str:
+        if self.ngram_prompt_lookup_max > 0:
+            draft_model = "[ngram]"
+        else:
+            draft_model = self.draft_model_config.model
+        num_spec_tokens = self.num_speculative_tokens
+        return f"SpeculativeConfig({draft_model=}, {num_spec_tokens=})"
+
+
 @dataclass
 class LoRAConfig:
     max_lora_rank: int
@@ -1177,6 +1615,28 @@ class LoRAConfig:
         if scheduler_config.chunked_prefill_enabled:
             raise ValueError("LoRA is not supported with chunked prefill yet.")
 
+class PromptAdapterConfig:
+    max_prompt_adapters: int
+    max_prompt_adapter_token: int
+    max_cpu_prompt_adapters: Optional[int] = None
+    prompt_adapter_dtype: Optional[torch.dtype] = None
+
+    def __post_init__(self):
+
+        if self.max_prompt_adapters < 1:
+            raise ValueError(f"max_prompt_adapters "
+                             f"({self.max_prompt_adapters}) must be >= 1.")
+        if self.max_prompt_adapter_token == 0:
+            raise ValueError("max_prompt_adapter_token must be set.")
+        if self.max_cpu_prompt_adapters is None:
+            self.max_cpu_prompt_adapters = self.max_prompt_adapters
+
+    def verify_with_model_config(self, model_config: ModelConfig):
+        if self.prompt_adapter_dtype in (None, "auto"):
+            self.prompt_adapter_dtype = model_config.dtype
+        elif isinstance(self.prompt_adapter_dtype, str):
+            self.prompt_adapter_dtype = getattr(torch,
+                                                self.prompt_adapter_dtype)
 
 @dataclass
 class MultiModalConfig:
@@ -1189,6 +1649,316 @@ class MultiModalConfig:
     """
 
     # TODO: Add configs to init vision tower or not.
+
+@dataclass
+class VisionLanguageConfig:
+    """Configs the input data format and how models should run for
+    vision language models."""
+
+    class ImageInputType(enum.Enum):
+        """Image input type into the vision language model.
+
+        An image roughly goes through the following transformation:
+        Raw image --> pixel values --> image features --> image embeddings.
+
+        The difference between different image input types is where the
+        image encoder (pixel values --> image features) is run.
+        Different image input types also correspond to different tensor shapes.
+
+        For example, for Llava, PIXEL_VALUES: (1, 3, 336, 336).
+        IMAGE_FEATURES: (1, 576, 1024).
+        """
+        PIXEL_VALUES = enum.auto()
+        IMAGE_FEATURES = enum.auto()
+
+    image_input_type: ImageInputType
+    # The input id corresponding to image token.
+    image_token_id: int
+    # Used for running `run_prefill_max_token`.
+    # For models that support varying resolution, this corresponds to
+    # worst case scenario (biggest supported resolution).
+    image_input_shape: tuple
+    image_feature_size: int
+    # The image processor to load from HuggingFace
+    image_processor: Optional[str]
+    image_processor_revision: Optional[str]
+
+    @classmethod
+    def get_image_input_enum_type(cls, value: str) -> ImageInputType:
+        """Get the image input type from a string."""
+        try:
+            return cls.ImageInputType[value.upper()]
+        except KeyError as e:
+            raise ValueError(f"{value} is not a valid choice. "
+                             f"Expecting to choose from "
+                             f"{[x.name for x in cls.ImageInputType]}.") from e
+
+    #TODO(ywang96): make this a cached property once we refactor the
+    # VisionLanguageConfig class.
+    def get_image_token_text(
+            self, tokenizer: PreTrainedTokenizerBase) -> Tuple[str, str]:
+        """Get the image token placeholder text to be inserted into the
+        text prompt and the string representation of the image token id.
+        """
+        image_token_str = tokenizer.decode(self.image_token_id)
+        return image_token_str * self.image_feature_size, image_token_str
+
+    def as_cli_args_dict(self) -> Dict[str, Any]:
+        """Flatten vision language config to pure args.
+
+        Compatible with what llm entrypoint expects.
+        """
+        result: Dict[str, Any] = {}
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if isinstance(value, enum.Enum):
+                result[f.name] = value.name.lower()
+            elif isinstance(value, tuple):
+                result[f.name] = ",".join([str(item) for item in value])
+            else:
+                result[f.name] = value
+
+        result["disable_image_processor"] = self.image_processor is None
+
+        return result
+
+@dataclass
+class WhisperConfig:
+    whisper_input_type: Optional[str] = 'input_features'
+    whisper_processor: Optional[str] = 'openai/whisper-large-v3'
+    whisper_processor_revision: Optional[str] = 'openai/whisper-large-v3'
+    sample_rate: Optional[int] = 16000
+
+    def as_cli_args_dict(self) -> Dict[str, Any]:
+        """Flatten vision language config to pure args.
+
+        Compatible with what llm entrypoint expects.
+        """
+        result: Dict[str, Any] = {}
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if isinstance(value, enum.Enum):
+                result[f.name] = value.name.lower()
+            elif isinstance(value, tuple):
+                result[f.name] = ",".join([str(item) for item in value])
+            else:
+                result[f.name] = value
+
+        return result
+
+
+_STR_DTYPE_TO_TORCH_DTYPE = {
+    "half": torch.float16,
+    "float16": torch.float16,
+    "float": torch.float32,
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+}
+
+_ROCM_NOT_SUPPORTED_DTYPE: List[str] = []  #
+
+
+def _get_and_verify_dtype(
+    config: PretrainedConfig,
+    dtype: Union[str, torch.dtype],
+) -> torch.dtype:
+    # NOTE: getattr(config, "torch_dtype", torch.float32) is not correct
+    # because config.torch_dtype can be None.
+    config_dtype = getattr(config, "torch_dtype", None)
+    if config_dtype is None:
+        config_dtype = torch.float32
+
+    if isinstance(dtype, str):
+        dtype = dtype.lower()
+        if dtype == "auto":
+            if config_dtype == torch.float32:
+                if config.model_type == "gemma2":
+                    logger.info(
+                        "For Gemma 2, we downcast float32 to bfloat16 instead "
+                        "of float16 by default. Please specify `dtype` if you "
+                        "want to use float16.")
+                    torch_dtype = torch.bfloat16
+                else:
+                    # Following the common practice, we use float16 for float32
+                    # models.
+                    torch_dtype = torch.float16
+            else:
+                torch_dtype = config_dtype
+
+            if current_platform.is_hpu() and config_dtype == torch.float16:
+                logger.info(
+                    "For HPU, we cast models to bfloat16 instead of"
+                    "using float16 by default. Please specify `dtype` if you "
+                    "want to use float16.")
+                torch_dtype = torch.bfloat16
+        else:
+            if dtype not in _STR_DTYPE_TO_TORCH_DTYPE:
+                raise ValueError(f"Unknown dtype: {dtype}")
+            torch_dtype = _STR_DTYPE_TO_TORCH_DTYPE[dtype]
+    elif isinstance(dtype, torch.dtype):
+        torch_dtype = dtype
+    else:
+        raise ValueError(f"Unknown dtype: {dtype}")
+
+    # Verify the dtype.
+    if torch_dtype != config_dtype:
+        if torch_dtype == torch.float32:
+            # Upcasting to float32 is allowed.
+            logger.info("Upcasting %s to %s.", config_dtype, torch_dtype)
+            pass
+        elif config_dtype == torch.float32:
+            # Downcasting from float32 to float16 or bfloat16 is allowed.
+            logger.info("Downcasting %s to %s.", config_dtype, torch_dtype)
+            pass
+        else:
+            # Casting between float16 and bfloat16 is allowed with a warning.
+            logger.warning("Casting %s to %s.", config_dtype, torch_dtype)
+
+    return torch_dtype
+
+
+def _get_and_verify_max_len(
+    hf_config: PretrainedConfig,
+    max_model_len: Optional[int],
+    disable_sliding_window: bool,
+    sliding_window_len: Optional[int],
+    spec_target_max_model_len: Optional[int] = None,
+) -> int:
+    """Get and verify the model's maximum length."""
+    derived_max_model_len = float("inf")
+    possible_keys = [
+        # OPT
+        "max_position_embeddings",
+        # GPT-2
+        "n_positions",
+        # MPT
+        "max_seq_len",
+        # ChatGLM2
+        "seq_length",
+        # Command-R
+        "model_max_length",
+        # Others
+        "max_sequence_length",
+        "max_seq_length",
+        "seq_len",
+    ]
+    # Choose the smallest "max_length" from the possible keys.
+    max_len_key = None
+    for key in possible_keys:
+        max_len = getattr(hf_config, key, None)
+        if max_len is not None:
+            max_len_key = key if max_len < derived_max_model_len \
+                else max_len_key
+            derived_max_model_len = min(derived_max_model_len, max_len)
+
+    # If sliding window is manually disabled, max_length should be less
+    # than the sliding window length in the model config.
+    if disable_sliding_window and sliding_window_len is not None:
+        max_len_key = "sliding_window" \
+            if sliding_window_len < derived_max_model_len else max_len_key
+        derived_max_model_len = min(derived_max_model_len, sliding_window_len)
+
+    # If none of the keys were found in the config, use a default and
+    # log a warning.
+    if derived_max_model_len == float("inf"):
+        if max_model_len is not None:
+            # If max_model_len is specified, we use it.
+            return max_model_len
+
+        if spec_target_max_model_len is not None:
+            # If this is a speculative draft model, we use the max model len
+            # from the target model.
+            return spec_target_max_model_len
+
+        default_max_len = 2048
+        logger.warning(
+            "The model's config.json does not contain any of the following "
+            "keys to determine the original maximum length of the model: "
+            "%s. Assuming the model's maximum length is %d.", possible_keys,
+            default_max_len)
+        derived_max_model_len = default_max_len
+
+    rope_scaling = getattr(hf_config, "rope_scaling", None)
+    if rope_scaling is not None:
+        if "type" in rope_scaling:
+            rope_type = rope_scaling["type"]
+        elif "rope_type" in rope_scaling:
+            rope_type = rope_scaling["rope_type"]
+        else:
+            raise ValueError(
+                "rope_scaling must have a 'type' or 'rope_type' key.")
+
+        # The correct one should be "longrope", kept "su" here
+        # to be backward compatible
+        if rope_type not in ("su", "longrope", "llama3"):
+            if disable_sliding_window:
+                # TODO(robertgshaw): Find a model that supports rope_scaling
+                # with sliding window to see if this case should be allowed.
+                raise NotImplementedError(
+                    "Disabling sliding window is not supported for models "
+                    "with rope_scaling. Please raise an issue so we can "
+                    "investigate.")
+
+            if rope_type == "mrope":
+                scaling_factor = 1
+            else:
+                assert "factor" in rope_scaling
+                scaling_factor = rope_scaling["factor"]
+            if rope_type == "yarn":
+                derived_max_model_len = rope_scaling[
+                    "original_max_position_embeddings"]
+            derived_max_model_len *= scaling_factor
+
+    # If the user specified a max length, make sure it is smaller than the
+    # derived length from the HF model config.
+    if max_model_len is None:
+        max_model_len = int(derived_max_model_len)
+    elif max_model_len > derived_max_model_len:
+        # Some models might have a separate key for specifying model_max_length
+        # that will be bigger than derived_max_model_len. We compare user input
+        # with model_max_length and allow this override when it's smaller.
+        model_max_length = getattr(hf_config, "model_max_length", None)
+        if model_max_length is not None and max_model_len <= model_max_length:
+            if disable_sliding_window:
+                # TODO(robertgshaw): Find a model that has model_max_length
+                # with sliding window to see if this case should be allowed.
+                raise NotImplementedError(
+                    "Disabling sliding window is not supported for models "
+                    "model_max_length in the config. Please raise an issue "
+                    "so we can investigate.")
+        else:
+            msg = (
+                f"User-specified max_model_len ({max_model_len}) is greater "
+                f"than the derived max_model_len ({max_len_key}="
+                f"{derived_max_model_len} or model_max_length="
+                f"{model_max_length} in model's config.json). This may lead "
+                "to incorrect model outputs or CUDA errors.")
+            if envs.VLLM_ALLOW_LONG_MAX_MODEL_LEN:
+                logger.warning(
+                    "%s Make sure the value is correct and within the "
+                    "model context size.", msg)
+            else:
+                raise ValueError(
+                    f"{msg} To allow overriding this maximum, set "
+                    "the env var VLLM_ALLOW_LONG_MAX_MODEL_LEN=1")
+    return int(max_model_len)
+
+
+def get_served_model_name(model: str,
+                          served_model_name: Optional[Union[str, List[str]]]):
+    """
+    If the input is a non-empty list, the first model_name in
+    `served_model_name` is taken.
+    If the input is a non-empty string, it is used directly.
+    For cases where the input is either an empty string or an
+    empty list, the fallback is to use `self.model`.
+    """
+    if not served_model_name:
+        return model
+    if isinstance(served_model_name, list):
+        return served_model_name[0]
+    return served_model_name
+
 
 @dataclass
 class DecodingConfig:
@@ -1204,3 +1974,72 @@ class DecodingConfig:
             raise ValueError(f"Invalid guided_decoding_backend '{backend},"
                              f"must be one of {valid_guided_backends}")
 
+
+@dataclass
+class ObservabilityConfig:
+    """Configuration for observability."""
+    otlp_traces_endpoint: Optional[str] = None
+
+    # Collecting detailed timing information for each request can be expensive.
+
+    # If set, collects the model forward time for the request.
+    collect_model_forward_time: bool = False
+
+    # If set, collects the model execute time for the request.
+    collect_model_execute_time: bool = False
+
+    def __post_init__(self):
+        if not is_otel_available() and self.otlp_traces_endpoint is not None:
+            raise ValueError(
+                "OpenTelemetry is not available. Unable to configure "
+                "'otlp_traces_endpoint'. Ensure OpenTelemetry packages are "
+                f"installed. Original error:\n{otel_import_error_traceback}")
+
+        if ((self.collect_model_forward_time
+             or self.collect_model_execute_time)
+                and self.otlp_traces_endpoint is None):
+            raise ValueError(
+                "collect_model_forward_time or collect_model_execute_time "
+                "requires --otlp-traces-endpoint to be set.")
+
+
+@dataclass(frozen=True)
+class EngineConfig:
+    """Dataclass which contains all engine-related configuration. This
+    simplifies passing around the distinct configurations in the codebase.
+    """
+
+    model_config: ModelConfig
+    cache_config: CacheConfig
+    parallel_config: ParallelConfig
+    scheduler_config: SchedulerConfig
+    device_config: DeviceConfig
+    load_config: LoadConfig
+    lora_config: Optional[LoRAConfig]
+    speculative_config: Optional[SpeculativeConfig]
+    decoding_config: Optional[DecodingConfig]
+    observability_config: Optional[ObservabilityConfig]
+    prompt_adapter_config: Optional[PromptAdapterConfig]
+
+    def __post_init__(self):
+        """Verify configs are valid & consistent with each other.
+        """
+        self.model_config.verify_async_output_proc(self.parallel_config,
+                                                   self.speculative_config,
+                                                   self.device_config)
+        self.model_config.verify_with_parallel_config(self.parallel_config)
+        self.cache_config.verify_with_parallel_config(self.parallel_config)
+
+        if self.lora_config:
+            self.lora_config.verify_with_model_config(self.model_config)
+            self.lora_config.verify_with_scheduler_config(
+                self.scheduler_config)
+        if self.prompt_adapter_config:
+            self.prompt_adapter_config.verify_with_model_config(
+                self.model_config)
+
+    def to_dict(self):
+        """Return the configs as a dictionary, for use in **kwargs.
+        """
+        return dict(
+            (field.name, getattr(self, field.name)) for field in fields(self))
