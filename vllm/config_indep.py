@@ -779,6 +779,136 @@ class LoadConfig:
                 f"{rocm_supported_load_format}")
 
 
+class ParallelConfig:
+    """Configuration for the distributed execution.
+
+    Args:
+        pipeline_parallel_size: Number of pipeline parallel groups.
+        tensor_parallel_size: Number of tensor parallel groups.
+        worker_use_ray: Deprecated, use distributed_executor_backend instead.
+        max_parallel_loading_workers: Maximum number of multiple batches
+            when load model sequentially. To avoid RAM OOM when using tensor
+            parallel and large models.
+        disable_custom_all_reduce: Disable the custom all-reduce kernel and
+            fall back to NCCL.
+        tokenizer_pool_config: Config for the tokenizer pool.
+            If None, will use synchronous tokenization.
+        ray_workers_use_nsight: Whether to profile Ray workers with nsight, see
+            https://docs.ray.io/en/latest/ray-observability/user-guides/profiling.html#profiling-nsight-profiler.
+        placement_group: ray distributed model workers placement group.
+        distributed_executor_backend: Backend to use for distributed model
+            workers, either "ray" or "mp" (multiprocessing). If either
+            pipeline_parallel_size or tensor_parallel_size is greater than 1,
+            will default to "ray" if Ray is installed or "mp" otherwise.
+    """
+
+    def __init__(
+        self,
+        pipeline_parallel_size: int,
+        tensor_parallel_size: int,
+        worker_use_ray: Optional[bool] = None,
+        max_parallel_loading_workers: Optional[int] = None,
+        disable_custom_all_reduce: bool = False,
+        tokenizer_pool_config: Optional[TokenizerPoolConfig] = None,
+        ray_workers_use_nsight: bool = False,
+        placement_group: Optional["PlacementGroup"] = None,
+        distributed_executor_backend: Optional[Union[
+            str, Type["ExecutorBase"]]] = None,
+    ) -> None:
+        self.pipeline_parallel_size = pipeline_parallel_size
+        self.tensor_parallel_size = tensor_parallel_size
+        self.distributed_executor_backend = distributed_executor_backend
+        self.max_parallel_loading_workers = max_parallel_loading_workers
+        self.disable_custom_all_reduce = disable_custom_all_reduce
+        self.tokenizer_pool_config = tokenizer_pool_config
+        self.ray_workers_use_nsight = ray_workers_use_nsight
+        self.placement_group = placement_group
+        self.world_size = pipeline_parallel_size * self.tensor_parallel_size
+
+        if worker_use_ray:
+            if self.distributed_executor_backend is None:
+                self.distributed_executor_backend = "ray"
+            elif not self.use_ray:
+                raise ValueError(f"worker-use-ray can't be used with "
+                                 f"distributed executor backend "
+                                 f"'{self.distributed_executor_backend}'.")
+
+        if current_platform.is_tpu() and self.world_size > 1:
+            if self.distributed_executor_backend is None:
+                self.distributed_executor_backend = "ray"
+            if self.distributed_executor_backend != "ray":
+                raise ValueError(
+                    "TPU backend only supports Ray for distributed inference.")
+
+        if current_platform.is_hpu() and self.world_size > 1:
+            if self.distributed_executor_backend is None:
+                self.distributed_executor_backend = "ray"
+            if self.distributed_executor_backend != "ray":
+                raise ValueError(
+                    "HPU backend only supports Ray for distributed inference.")
+
+        if self.distributed_executor_backend is None and self.world_size > 1:
+            # We use multiprocessing by default if world_size fits on the
+            # current node and we aren't in a ray placement group.
+
+            from vllm.executor import ray_utils
+            backend = "mp"
+            ray_found = ray_utils.ray_is_available()
+            if (current_platform.is_cuda()
+                    and cuda_device_count_stateless() < self.world_size):
+                if not ray_found:
+                    raise ValueError("Unable to load Ray which is "
+                                     "required for multi-node inference, "
+                                     "please install Ray with `pip install "
+                                     "ray`.") from ray_utils.ray_import_err
+                backend = "ray"
+            elif ray_found:
+                if self.placement_group:
+                    backend = "ray"
+                else:
+                    from ray import is_initialized as ray_is_initialized
+                    if ray_is_initialized():
+                        from ray.util import get_current_placement_group
+                        if get_current_placement_group():
+                            backend = "ray"
+            self.distributed_executor_backend = backend
+            logger.info("Defaulting to use %s for distributed inference",
+                        backend)
+
+        self._verify_args()
+        self.rank: int = 0
+
+    @property
+    def use_ray(self) -> bool:
+        return self.distributed_executor_backend == "ray" or (
+            isinstance(self.distributed_executor_backend, type)
+            and self.distributed_executor_backend.uses_ray)
+
+    def _verify_args(self) -> None:
+        # Lazy import to avoid circular import
+        from vllm.executor.executor_base import ExecutorBase
+
+        if self.distributed_executor_backend not in (
+                "ray", "mp", None) and not (isinstance(
+                    self.distributed_executor_backend, type) and issubclass(
+                        self.distributed_executor_backend, ExecutorBase)):
+            raise ValueError(
+                "Unrecognized distributed executor backend "
+                f"{self.distributed_executor_backend}. Supported "
+                "values are 'ray', 'mp' or custom ExecutorBase subclass.")
+        if self.use_ray:
+            from vllm.executor import ray_utils
+            ray_utils.assert_ray_available()
+        if is_hip():
+            self.disable_custom_all_reduce = True
+            logger.info(
+                "Disabled the custom all-reduce kernel because it is not "
+                "supported on AMD GPUs.")
+        if self.ray_workers_use_nsight and not self.use_ray:
+            raise ValueError("Unable to use nsight profiling unless workers "
+                             "run with Ray.")
+
+
 class SchedulerConfig:
     """Scheduler configuration.
 
