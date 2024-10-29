@@ -3,8 +3,8 @@ from typing import (TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional,
                     Tuple, Type, Union)
 
 import vllm.envs as envs
-from vllm.config_indep CacheConfig, LoRAConfig, DeviceConfig, SchedulerConfig, ModelConfig, LoadConfig, ParallelConfig
-from vllm.config import (ConfigFormat, DecodingConfig,
+from vllm.config_indep import CacheConfig, LoRAConfig, DeviceConfig, SchedulerConfig, ModelConfig, LoadConfig, ParallelConfig, ConfigFormat
+from vllm.config import (DecodingConfig,
                          EngineConfig, LoadFormat,
                          ObservabilityConfig,
                          PromptAdapterConfig,

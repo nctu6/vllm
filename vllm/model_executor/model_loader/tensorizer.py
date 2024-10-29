@@ -14,7 +14,7 @@ from transformers import PretrainedConfig
 
 import vllm.envs as envs
 from vllm.config_indep import ModelConfig, ParallelConfig
-from vllm.engine.arg_utils import EngineArgs
+from vllm.engine.arg_utils_indep import EngineArgs
 from vllm.engine.llm_engine import LLMEngine
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
