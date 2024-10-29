@@ -3,10 +3,11 @@ import warnings
 import pytest
 import torch.cuda
 
-from vllm.model_executor.models import (is_embedding_model,
+from vllm.model_executor.models import (is_embedding_model, is_whisper_model,
                                         is_text_generation_model,
                                         supports_multimodal)
 from vllm.model_executor.models.registry import (_EMBEDDING_MODELS,
+                                                 _WHISPER_MODELS,
                                                  _MULTIMODAL_MODELS,
                                                  _SPECULATIVE_DECODING_MODELS,
                                                  _TEXT_GENERATION_MODELS,
@@ -30,6 +31,9 @@ def test_registry_imports(model_arch):
 
         assert is_embedding_model(model_cls) is (model_arch
                                                  in _EMBEDDING_MODELS)
+
+        assert is_whisper_model(model_cls) is (model_arch
+                                                 in _WHISPER_MODELS)
 
         assert supports_multimodal(model_cls) is (model_arch
                                                   in _MULTIMODAL_MODELS)

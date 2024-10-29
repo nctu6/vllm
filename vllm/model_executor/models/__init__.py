@@ -4,12 +4,14 @@ from .interfaces import (HasInnerState, SupportsLoRA, SupportsMultiModal,
 from .interfaces_base import (VllmModelForEmbedding,
                               VllmModelForTextGeneration, is_embedding_model,
                               is_text_generation_model, is_whisper_model)
+from vllm.model_executor.models.whisper import WhisperForConditionalGeneration
 from .registry import ModelRegistry
 
 __all__ = [
     "ModelRegistry",
     "VllmModelForEmbedding",
     "is_embedding_model",
+    "WhisperForConditionalGeneration"
     "is_whisper_model",
     "VllmModelForTextGeneration",
     "is_text_generation_model",

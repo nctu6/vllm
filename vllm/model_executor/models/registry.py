@@ -16,7 +16,7 @@ from vllm.utils import is_hip
 
 from .interfaces import (has_inner_state, is_attention_free,
                          supports_multimodal, supports_pp)
-from .interfaces_base import is_embedding_model, is_text_generation_model
+from .interfaces_base import is_embedding_model, is_text_generation_model, is_whisper_model
 
 logger = init_logger(__name__)
 
@@ -168,6 +168,7 @@ _ROCM_PARTIALLY_SUPPORTED_MODELS: Dict[str, str] = {
 class _ModelInfo:
     is_text_generation_model: bool
     is_embedding_model: bool
+    is_whisper_model: bool
     supports_multimodal: bool
     supports_pp: bool
     has_inner_state: bool
@@ -178,6 +179,7 @@ class _ModelInfo:
         return _ModelInfo(
             is_text_generation_model=is_text_generation_model(model),
             is_embedding_model=is_embedding_model(model),
+            is_whisper_model=is_whisper_model(model),
             supports_multimodal=supports_multimodal(model),
             supports_pp=supports_pp(model),
             has_inner_state=has_inner_state(model),
@@ -405,17 +407,17 @@ class _ModelRegistry:
     ) -> bool:
         return self.inspect_model_cls(architectures).is_embedding_model
 
-    def is_multimodal_model(
-        self,
-        architectures: Union[str, List[str]],
-    ) -> bool:
-        return self.inspect_model_cls(architectures).supports_multimodal
-
     def is_whisper_model(
         self,
         architectures: Union[str, List[str]],
     ) -> bool:
         return self.inspect_model_cls(architectures).is_whisper_model
+
+    def is_multimodal_model(
+        self,
+        architectures: Union[str, List[str]],
+    ) -> bool:
+        return self.inspect_model_cls(architectures).supports_multimodal
 
     def is_pp_supported_model(
         self,

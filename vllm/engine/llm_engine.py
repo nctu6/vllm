@@ -348,7 +348,7 @@ class LLMEngine:
         self.input_registry = input_registry
         self.input_processor = input_registry.create_input_processor(
             model_config)
-        
+
         self.model_executor = executor_class(
             model_config=model_config,
             cache_config=cache_config,
@@ -741,7 +741,7 @@ class LLMEngine:
             if self.whisper_processor is None:
                 raise ValueError(f"Whisper Processor is not initialized.")
             whisper_data = self.whisper_processor(
-                inputs['whisper_data'], 
+                inputs['whisper_data'],
                 sampling_rate = self.whisper_config.sample_rate,
                 return_tensors = 'pt',
             )
@@ -782,7 +782,7 @@ class LLMEngine:
                                                 lora_request=lora_request)
                                                 add_special_tokens=self.whisper_processor is None)
         ...
-            
+
 
     @overload
     def add_request(
@@ -1047,9 +1047,9 @@ class LLMEngine:
         This function updates num_computed_tokens for prompt sequences
         when Multi-Step is enabled.
 
-        seq_group: SequenceGroup to update the num_computed_tokens for. 
+        seq_group: SequenceGroup to update the num_computed_tokens for.
         seq_group_meta: Metadata of the given SequenceGroup.
-        is_first_step_output: Optional[bool] - 
+        is_first_step_output: Optional[bool] -
             When available, is_first_step_output indicates if the appended
             output token is the output of the first-step in multi-step.
             A value of None indicates that outputs from all steps in
@@ -1929,6 +1929,9 @@ class LLMEngine:
 
     def is_embedding_model(self):
         return self.model_config.is_embedding_model
+
+    def is_whisper_model(self):
+        return self.model_config.is_whisper_model
 
     def _validate_model_inputs(self, inputs: Union[LLMInputs,
                                                    EncoderDecoderLLMInputs]):

@@ -40,8 +40,8 @@ class ModelConfig:
 
     Args:
         model: Name or path of the huggingface model to use.
-            It is also used as the content for `model_name` tag in metrics 
-            output when `served_model_name` is not specified. 
+            It is also used as the content for `model_name` tag in metrics
+            output when `served_model_name` is not specified.
         tokenizer: Name or path of the huggingface tokenizer to use.
         tokenizer_mode: Tokenizer mode. "auto" will use the fast tokenizer if
             available, "slow" will always use the slow tokenizer, and
@@ -92,15 +92,15 @@ class ModelConfig:
         skip_tokenizer_init: If true, skip initialization of tokenizer and
             detokenizer.
         served_model_name: The model name used in metrics tag `model_name`,
-            matches the model name exposed via the APIs. If multiple model 
-            names provided, the first name will be used. If not specified, 
+            matches the model name exposed via the APIs. If multiple model
+            names provided, the first name will be used. If not specified,
             the model name will be the same as `model`.
-        limit_mm_per_prompt: Maximum number of data instances per modality 
+        limit_mm_per_prompt: Maximum number of data instances per modality
             per prompt. Only applicable for multimodal models.
-        override_neuron_config: Initialize non default neuron config or 
-            override default neuron config that are specific to Neuron devices, 
-            this argument will be used to configure the neuron config that 
-            can not be gathered from the vllm arguments. 
+        override_neuron_config: Initialize non default neuron config or
+            override default neuron config that are specific to Neuron devices,
+            this argument will be used to configure the neuron config that
+            can not be gathered from the vllm arguments.
         config_format: The config format which shall be loaded.
             Defaults to 'auto' which defaults to 'hf'.
         mm_processor_kwargs: Arguments to be forwarded to the model's processor
@@ -203,6 +203,7 @@ class ModelConfig:
         self.override_neuron_config = override_neuron_config if is_neuron(
         ) else None
         self._verify_embedding_mode()
+        self._verify_whisper_mode()
         self._verify_quantization()
         self._verify_cuda_graph()
         self._verify_bnb_config()
@@ -242,8 +243,8 @@ class ModelConfig:
 
     def _verify_whisper_mode(self) -> None:
         architectures = getattr(self.hf_config, "architectures", [])
-        self.whisper_mode = any(
-            ModelRegistry.is_whisper_model(arch) for arch in architectures)
+        self.whisper_mode = ModelRegistry.is_whisper_model(architectures)
+
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
         if quant_cfg is None:
@@ -332,7 +333,7 @@ class ModelConfig:
 
     def _verify_bnb_config(self) -> None:
         """
-        The current version of bitsandbytes (0.44.0) with 8-bit models does not 
+        The current version of bitsandbytes (0.44.0) with 8-bit models does not
         yet support CUDA graph.
         """
         is_bitsandbytes = self.quantization == "bitsandbytes"
@@ -578,6 +579,11 @@ class ModelConfig:
         return self.embedding_mode
 
     @property
+    def is_whisper_model(self) -> bool:
+        """Extract the embedding model flag."""
+        return self.whisper_mode
+
+    @property
     def is_multimodal_model(self) -> bool:
         return self.multimodal_config is not None
 
@@ -761,7 +767,7 @@ class LoadConfig:
                 fast weight loading.
             "bitsandbytes" will load nf4 type weights.
         ignore_patterns: The list of patterns to ignore when loading the model.
-            Default to "original/**/*" to avoid repeated loading of llama's 
+            Default to "original/**/*" to avoid repeated loading of llama's
             checkpoints.
         device: Device to which model weights will be loaded, default to
             device_config.device
@@ -946,7 +952,7 @@ class SchedulerConfig:
         max_num_seqs: Maximum number of sequences to be processed in a single
             iteration.
         max_num_prefill_seqs: Maximum number of prefill sequences to be
-             processed in a single iteration. Used only with padding-aware 
+             processed in a single iteration. Used only with padding-aware
              scheduling.
         max_model_len: Maximum length of a sequence (including prompt
             and generated text).
@@ -960,7 +966,7 @@ class SchedulerConfig:
         enable_chunked_prefill: If True, prefill requests can be chunked based
             on the remaining max_num_batched_tokens.
         embedding_mode: Whether the running model is for embedding.
-        preemption_mode: Whether to perform preemption by swapping or 
+        preemption_mode: Whether to perform preemption by swapping or
             recomputation. If not specified, we determine the mode as follows:
             We use recomputation by default since it incurs lower overhead than
             swapping. However, when the sequence group has multiple sequences
@@ -1213,7 +1219,7 @@ class SpeculativeConfig:
             typical_acceptance_sampler_posterior_threshold (Optional[float]):
                 A threshold value that sets a lower bound on the posterior
                 probability of a token in the target model for it to be
-                accepted. This threshold is used only when we use the 
+                accepted. This threshold is used only when we use the
                 TypicalAcceptanceSampler for token acceptance.
             typical_acceptance_sampler_posterior_alpha (Optional[float]):
                 A scaling factor for the entropy-based threshold in the
@@ -1223,7 +1229,7 @@ class SpeculativeConfig:
                 If set to False, token log probabilities are returned
                 according to the log probability settings in SamplingParams.
                 If not specified, it defaults to True.
-    
+
         Returns:
             Optional["SpeculativeConfig"]: An instance of SpeculativeConfig if
                 the necessary conditions are met, else None.
@@ -1472,13 +1478,13 @@ class SpeculativeConfig:
             typical_acceptance_sampler_posterior_threshold (Optional[float]):
                 A threshold value that sets a lower bound on the posterior
                 probability of a token in the target model for it to be
-                accepted. This threshold is used only when we use the 
+                accepted. This threshold is used only when we use the
                 TypicalAcceptanceSampler for token acceptance.
             typical_acceptance_sampler_posterior_alpha (Optional[float]):
                 A scaling factor for the entropy-based threshold in the
                 TypicalAcceptanceSampler.
             disable_logprobs: If set to True, token log probabilities will not
-                be returned even if requested by sampling parameters. This 
+                be returned even if requested by sampling parameters. This
                 reduces latency by skipping logprob calculation in proposal
                 sampling, target sampling, and after accepted tokens are
                 determined. If set to False, log probabilities will be
@@ -1643,7 +1649,7 @@ class MultiModalConfig:
     """
 
     # TODO: Add configs to init vision tower or not.
-												
+
 @dataclass
 class VisionLanguageConfig:
     """Configs the input data format and how models should run for
@@ -1691,7 +1697,7 @@ class VisionLanguageConfig:
     # VisionLanguageConfig class.
     def get_image_token_text(
             self, tokenizer: PreTrainedTokenizerBase) -> Tuple[str, str]:
-        """Get the image token placeholder text to be inserted into the 
+        """Get the image token placeholder text to be inserted into the
         text prompt and the string representation of the image token id.
         """
         image_token_str = tokenizer.decode(self.image_token_id)
@@ -1941,10 +1947,10 @@ def _get_and_verify_max_len(
 def get_served_model_name(model: str,
                           served_model_name: Optional[Union[str, List[str]]]):
     """
-    If the input is a non-empty list, the first model_name in 
-    `served_model_name` is taken. 
-    If the input is a non-empty string, it is used directly. 
-    For cases where the input is either an empty string or an 
+    If the input is a non-empty list, the first model_name in
+    `served_model_name` is taken.
+    If the input is a non-empty string, it is used directly.
+    For cases where the input is either an empty string or an
     empty list, the fallback is to use `self.model`.
     """
     if not served_model_name:

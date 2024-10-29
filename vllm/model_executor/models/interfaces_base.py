@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.sampler import SamplerOutput
     from vllm.model_executor.pooling_metadata import PoolingMetadata
     from vllm.model_executor.sampling_metadata import SamplingMetadata
+    from vllm.model_executor.models.whisper import WhisperForConditionalGeneration
 
 logger = init_logger(__name__)
 
@@ -189,3 +190,28 @@ def is_embedding_model(
         return isinstance(model, VllmModelForEmbedding)
 
     return isinstance(model, VllmModelForEmbedding)
+
+
+@overload
+def is_whisper_model(
+        model: Type[object]) -> TypeIs[Type[WhisperForConditionalGeneration]]:
+    ...
+
+
+@overload
+def is_whisper_model(
+        model: object) -> TypeIs[WhisperForConditionalGeneration]:
+    ...
+
+
+def is_whisper_model(
+    model: Union[Type[object], object],
+) -> Union[TypeIs[Type[WhisperForConditionalGeneration]],
+           TypeIs[WhisperForConditionalGeneration]]:
+    if not is_vllm_model(model):
+        return False
+
+    if isinstance(model, type):
+        return isinstance(model, WhisperForConditionalGeneration)
+
+    return isinstance(model, WhisperForConditionalGeneration)
