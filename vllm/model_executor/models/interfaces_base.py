@@ -17,7 +17,8 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.sampler import SamplerOutput
     from vllm.model_executor.pooling_metadata import PoolingMetadata
     from vllm.model_executor.sampling_metadata import SamplingMetadata
-    from vllm.model_executor.models.whisper import WhisperForConditionalGeneration
+
+from vllm.model_executor.models.whisper import WhisperForConditionalGeneration
 
 logger = init_logger(__name__)
 
