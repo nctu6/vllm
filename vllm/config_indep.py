@@ -701,6 +701,60 @@ class DeviceConfig:
             # Set device with device type
             self.device = torch.device(self.device_type)
 
+
+@dataclass
+class TokenizerPoolConfig:
+    """Configuration for the tokenizer pool.
+
+    Args:
+        pool_size: Number of tokenizer workers in the pool.
+        pool_type: Type of the pool.
+        extra_config: Additional config for the pool.
+            The way the config will be used depends on the
+            pool type.
+    """
+    pool_size: int
+    pool_type: Union[str, Type["BaseTokenizerGroup"]]
+    extra_config: dict
+
+    def __post_init__(self):
+        if self.pool_type not in ("ray", ) and not isinstance(
+                self.pool_type, type):
+            raise ValueError(f"Unknown pool type: {self.pool_type}")
+        if not isinstance(self.extra_config, dict):
+            raise ValueError("extra_config must be a dictionary.")
+
+    @classmethod
+    def create_config(
+        cls, tokenizer_pool_size: int, tokenizer_pool_type: str,
+        tokenizer_pool_extra_config: Optional[Union[str, dict]]
+    ) -> Optional["TokenizerPoolConfig"]:
+        """Create a TokenizerPoolConfig from the given parameters.
+
+        If tokenizer_pool_size is 0, return None.
+
+        Args:
+            tokenizer_pool_size: Number of tokenizer workers in the pool.
+            tokenizer_pool_type: Type of the pool.
+            tokenizer_pool_extra_config: Additional config for the pool.
+                The way the config will be used depends on the
+                pool type. This can be a JSON string (will be parsed).
+        """
+        if tokenizer_pool_size:
+            if isinstance(tokenizer_pool_extra_config, str):
+                tokenizer_pool_extra_config_parsed = json.loads(
+                    tokenizer_pool_extra_config)
+            else:
+                tokenizer_pool_extra_config_parsed = (
+                    tokenizer_pool_extra_config or {})
+            tokenizer_pool_config = cls(tokenizer_pool_size,
+                                        tokenizer_pool_type,
+                                        tokenizer_pool_extra_config_parsed)
+        else:
+            tokenizer_pool_config = None
+        return tokenizer_pool_config
+
+
 class LoadFormat(str, enum.Enum):
     AUTO = "auto"
     PT = "pt"
