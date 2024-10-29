@@ -6,7 +6,7 @@ from torch import nn
 from transformers import WhisperConfig
 
 from vllm.attention import Attention, AttentionMetadata
-from vllm.config import CacheConfig
+from vllm.config_indep import CacheConfig
 from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
 from vllm.model_executor.layers.activation import FastGELU
@@ -95,7 +95,7 @@ class WhisperAttention(nn.Module):
             bias = bias,
             quant_config=quant_config
         )
-    
+
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).contiguous()
 
@@ -118,7 +118,7 @@ class WhisperEncoderAttention(WhisperAttention):
             quant_config=quant_config,
             cache_config=cache_config
         )
-        
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -146,11 +146,11 @@ class WhisperEncoderAttention(WhisperAttention):
             op=xops.fmha.MemoryEfficientAttentionFlashAttentionOp[0] if
             (is_hip()) else None,
         )
-        
+
         attn_output = attn_output.reshape(-1, self.embed_dim)
         output, _ = self.out_proj(attn_output)
         return output
-    
+
 class WhisperDecoderAttention(WhisperAttention):
     def __init__(
         self,
@@ -177,7 +177,7 @@ class WhisperDecoderAttention(WhisperAttention):
             cache_config=cache_config,
             quant_config=quant_config
         )
-    
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -217,7 +217,7 @@ class WhisperDecoderCrossAttention(WhisperAttention):
             quant_config=quant_config,
             cache_config=cache_config
         )
-        
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -248,14 +248,14 @@ class WhisperDecoderCrossAttention(WhisperAttention):
             op=xops.fmha.MemoryEfficientAttentionFlashAttentionOp[0] if
             (is_hip()) else None,
         )
-        
+
         attn_output = attn_output.reshape(-1, self.embed_dim)
         output, _ = self.out_proj(attn_output)
         return output
 
 class WhisperEncoderLayer(nn.Module):
     def __init__(
-        self, 
+        self,
         config: WhisperConfig,
         quant_config: Optional[QuantizationConfig] = None,
         cache_config: Optional[CacheConfig] = None,
@@ -284,7 +284,7 @@ class WhisperEncoderLayer(nn.Module):
             quant_config=quant_config,
         )
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
-    
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -312,7 +312,7 @@ class WhisperEncoderLayer(nn.Module):
 
 class WhisperDecoderLayer(nn.Module):
     def __init__(
-        self, 
+        self,
         config: WhisperConfig,
         quant_config: Optional[QuantizationConfig] = None,
         cache_config: Optional[CacheConfig] = None,
@@ -350,7 +350,7 @@ class WhisperDecoderLayer(nn.Module):
             quant_config=quant_config,
         )
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
-    
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -388,7 +388,7 @@ class WhisperDecoderLayer(nn.Module):
 
 class WhisperEncoder(nn.Module):
     def __init__(
-        self, 
+        self,
         config: WhisperConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
@@ -407,12 +407,12 @@ class WhisperEncoder(nn.Module):
 
         self.layers = nn.ModuleList([WhisperEncoderLayer(config, quant_config=quant_config, cache_config=cache_config)
                                      for layer_idx in range(config.encoder_layers)])
-        
+
         self.layer_norm = nn.LayerNorm(config.d_model)
 
         with torch.no_grad():
             self.embed_positions.weight.copy_(sinusoids(*self.embed_positions.weight.shape))
-    
+
     def forward(
         self,
         input_features,
@@ -420,19 +420,19 @@ class WhisperEncoder(nn.Module):
         inputs_embeds = nn.functional.gelu(self.conv1(input_features))
         inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
         inputs_embeds = inputs_embeds.permute(1, 0)
-    
+
         embed_pos = self.embed_positions.weight
 
         hidden_states = inputs_embeds + embed_pos
         for idx, encoder_layer in enumerate(self.layers):
             hidden_states = encoder_layer(hidden_states)
-        
+
         hidden_states = self.layer_norm(hidden_states)
         return hidden_states
 
 class WhisperDecoder(nn.Module):
     def __init__(
-        self, 
+        self,
         config: WhisperConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
@@ -450,7 +450,7 @@ class WhisperDecoder(nn.Module):
         self.layers = nn.ModuleList([WhisperDecoderLayer(config, quant_config=quant_config, cache_config=cache_config)
                                      for layer_idx in range(config.decoder_layers)])
         self.layer_norm = nn.LayerNorm(config.d_model)
-    
+
     def forward(
         self,
         input_ids,
@@ -477,7 +477,7 @@ class WhisperDecoder(nn.Module):
 
 class WhisperModel(nn.Module):
     def __init__(
-        self, 
+        self,
         config: WhisperConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
@@ -486,7 +486,7 @@ class WhisperModel(nn.Module):
 
         self.encoder = WhisperEncoder(config, cache_config=cache_config, quant_config=quant_config)
         self.decoder = WhisperDecoder(config, cache_config=cache_config, quant_config=quant_config)
-    
+
     def forward(
         self,
         input_features: torch.FloatTensor,
@@ -494,7 +494,7 @@ class WhisperModel(nn.Module):
         positions: torch.Tensor,
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
-    ): 
+    ):
         encoder_outputs = self.encoder(input_features)
 
         decoder_outputs = self.decoder(
@@ -508,7 +508,7 @@ class WhisperModel(nn.Module):
 
 class WhisperForConditionalGeneration(nn.Module):
     def __init__(
-        self, 
+        self,
         config: WhisperConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
@@ -535,7 +535,7 @@ class WhisperForConditionalGeneration(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> SamplerOutput:
-        
+
         decoder_outputs = self.model(
             input_features=whisper_data,
             input_ids=input_ids,
@@ -544,13 +544,13 @@ class WhisperForConditionalGeneration(nn.Module):
             attn_metadata=attn_metadata,
         )
         return decoder_outputs
-    
+
     def compute_logits(self, hidden_states: torch.Tensor,
                        sampling_metadata: SamplingMetadata) -> torch.Tensor:
         logits = self.logits_processor(self.proj_out.weight, hidden_states,
                                        sampling_metadata)
         return logits
-    
+
     def sample(
         self,
         logits: torch.Tensor,
