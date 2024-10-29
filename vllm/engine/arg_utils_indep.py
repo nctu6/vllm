@@ -3,9 +3,9 @@ from typing import (TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional,
                     Tuple, Type, Union)
 
 import vllm.envs as envs
-from vllm.config_indep import CacheConfig, LoRAConfig, DeviceConfig, SchedulerConfig, ModelConfig, LoadConfig, ParallelConfig, ConfigFormat
-from vllm.config import (DecodingConfig,
-                         EngineConfig, LoadFormat,
+from vllm.transformers_utils.config import ConfigFormat
+from vllm.config_indep import CacheConfig, LoRAConfig, DeviceConfig, SchedulerConfig, ModelConfig, LoadConfig, ParallelConfig, DecodingConfig
+from vllm.config import (EngineConfig, LoadFormat,
                          ObservabilityConfig,
                          PromptAdapterConfig,
 						 SpeculativeConfig, TokenizerPoolConfig,
