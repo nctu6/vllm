@@ -13,7 +13,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 import vllm.envs as envs
-from vllm.config import ModelConfig, ParallelConfig
+from vllm.config_indep import ModelConfig, ParallelConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.llm_engine import LLMEngine
 from vllm.logger import init_logger
@@ -125,30 +125,30 @@ class TensorizerArgs:
     s3_secret_access_key: Optional[str] = None
     s3_endpoint: Optional[str] = None
     """
-  Args for the TensorizerAgent class. These are used to configure the behavior 
+  Args for the TensorizerAgent class. These are used to configure the behavior
   of the TensorDeserializer when loading tensors from a serialized model.
-  
+
   Args:
-      tensorizer_uri: Path to serialized model tensors. Can be a local file 
+      tensorizer_uri: Path to serialized model tensors. Can be a local file
           path or a S3 URI.
-      vllm_tensorized: If True, indicates that the serialized model is a 
-          vLLM model. This is used to determine the behavior of the 
+      vllm_tensorized: If True, indicates that the serialized model is a
+          vLLM model. This is used to determine the behavior of the
           TensorDeserializer when loading tensors from a serialized model.
           It is far faster to deserialize a vLLM model as it utilizes
           tensorizer's optimized GPU loading. Note that this is now
           deprecated, as serialized vLLM models are now automatically
           inferred as vLLM models.
-      verify_hash: If True, the hashes of each tensor will be verified against 
-          the hashes stored in the metadata. A `HashMismatchError` will be 
+      verify_hash: If True, the hashes of each tensor will be verified against
+          the hashes stored in the metadata. A `HashMismatchError` will be
           raised if any of the hashes do not match.
       num_readers: Controls how many threads are allowed to read concurrently
           from the source file. Default is `None`, which will dynamically set
-          the number of readers based on the number of available 
+          the number of readers based on the number of available
           resources and model size. This greatly increases performance.
-      encryption_keyfile: File path to a binary file containing a  
-          binary key to use for decryption. `None` (the default) means 
-          no decryption. See the example script in 
-          examples/tensorize_vllm_model.py. 
+      encryption_keyfile: File path to a binary file containing a
+          binary key to use for decryption. `None` (the default) means
+          no decryption. See the example script in
+          examples/tensorize_vllm_model.py.
       s3_access_key_id: The access key for the S3 bucket. Can also be set via
           the S3_ACCESS_KEY_ID environment variable.
       s3_secret_access_key: The secret access key for the S3 bucket. Can also
