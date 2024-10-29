@@ -21,7 +21,7 @@ from torch import nn
 from transformers import AutoModelForCausalLM, PretrainedConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoadFormat,
+from vllm.config_indep import (CacheConfig, DeviceConfig, LoadConfig, LoadFormat,
                          LoRAConfig, ModelConfig, MultiModalConfig,
                          ParallelConfig, SchedulerConfig)
 from vllm.distributed import (get_tensor_model_parallel_rank,
@@ -809,8 +809,8 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             model_name_or_path: str,
             allowed_patterns: List[str],
             revision: Optional[str] = None) -> Tuple[List[str], str]:
-        """Retrieve weight files. Download the files if necessary. 
-        
+        """Retrieve weight files. Download the files if necessary.
+
         Return the weight files and the file pattern."""
         is_local = os.path.isdir(model_name_or_path)
 
