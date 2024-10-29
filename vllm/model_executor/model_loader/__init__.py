@@ -2,9 +2,8 @@ from typing import Optional
 
 from torch import nn
 
-from vllm.config_indep import CacheConfig, DeviceConfig, LoadConfig
-from vllm.config import (LoRAConfig,
-                         ModelConfig, ParallelConfig, SchedulerConfig)
+from vllm.config_indep import CacheConfig, DeviceConfig, LoadConfig, LoRAConfig
+from vllm.config import (ModelConfig, ParallelConfig, SchedulerConfig)
 from vllm.model_executor.model_loader.loader import (BaseModelLoader,
                                                      get_model_loader)
 from vllm.model_executor.model_loader.utils import (

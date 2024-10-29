@@ -212,3 +212,56 @@ class LoadConfig:
                 f"Supported load formats are "
                 f"{rocm_supported_load_format}")
 
+
+@dataclass
+class LoRAConfig:
+    max_lora_rank: int
+    max_loras: int
+    fully_sharded_loras: bool = False
+    max_cpu_loras: Optional[int] = None
+    lora_dtype: Optional[torch.dtype] = None
+    lora_extra_vocab_size: int = 256
+    # This is a constant.
+    lora_vocab_padding_size: ClassVar[int] = 256
+    long_lora_scaling_factors: Optional[Tuple[float]] = None
+
+    def __post_init__(self):
+        # Setting the maximum rank to 256 should be able to satisfy the vast
+        # majority of applications.
+        possible_max_ranks = (8, 16, 32, 64, 128, 256)
+        possible_lora_extra_vocab_size = (0, 256, 512)
+        if self.max_lora_rank not in possible_max_ranks:
+            raise ValueError(
+                f"max_lora_rank ({self.max_lora_rank}) must be one of "
+                f"{possible_max_ranks}.")
+        if self.lora_extra_vocab_size not in possible_lora_extra_vocab_size:
+            raise ValueError(
+                f"lora_extra_vocab_size ({self.lora_extra_vocab_size}) "
+                f"must be one of {possible_lora_extra_vocab_size}.")
+        if self.max_loras < 1:
+            raise ValueError(f"max_loras ({self.max_loras}) must be >= 1.")
+        if self.max_cpu_loras is None:
+            self.max_cpu_loras = self.max_loras
+        elif self.max_cpu_loras < self.max_loras:
+            raise ValueError(
+                f"max_cpu_loras ({self.max_cpu_loras}) must be >= "
+                f"max_loras ({self.max_loras})")
+
+    def verify_with_model_config(self, model_config: ModelConfig):
+        if self.lora_dtype in (None, "auto"):
+            self.lora_dtype = model_config.dtype
+        elif isinstance(self.lora_dtype, str):
+            self.lora_dtype = getattr(torch, self.lora_dtype)
+        if model_config.quantization and model_config.quantization not in [
+                "awq", "gptq"
+        ]:
+            # TODO support marlin
+            logger.warning("%s quantization is not tested with LoRA yet.",
+                           model_config.quantization)
+
+    def verify_with_scheduler_config(self, scheduler_config: SchedulerConfig):
+        # Reminder: Please update docs/source/serving/compatibility_matrix.rst
+        # If the feature combo become valid
+        if scheduler_config.chunked_prefill_enabled:
+            raise ValueError("LoRA is not supported with chunked prefill yet.")
+
