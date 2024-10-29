@@ -5,6 +5,562 @@ from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple,
                     Union)
 
 import torch
+from vllm.transformers_utils.config import (ConfigFormat, get_config,
+                                            get_hf_image_processor_config,
+                                            get_hf_text_config)
+
+class ModelConfig:
+    """Configuration for the model.
+
+    Args:
+        model: Name or path of the huggingface model to use.
+            It is also used as the content for `model_name` tag in metrics
+            output when `served_model_name` is not specified.
+        tokenizer: Name or path of the huggingface tokenizer to use.
+        tokenizer_mode: Tokenizer mode. "auto" will use the fast tokenizer if
+            available, "slow" will always use the slow tokenizer, and
+            "mistral" will always use the tokenizer from `mistral_common`.
+        trust_remote_code: Trust remote code (e.g., from HuggingFace) when
+            downloading the model and tokenizer.
+        dtype: Data type for model weights and activations. The "auto" option
+            will use FP16 precision for FP32 and FP16 models, and BF16 precision
+            for BF16 models.
+        seed: Random seed for reproducibility.
+        revision: The specific model version to use. It can be a branch name,
+            a tag name, or a commit id. If unspecified, will use the default
+            version.
+        code_revision: The specific revision to use for the model code on
+            Hugging Face Hub. It can be a branch name, a tag name, or a
+            commit id. If unspecified, will use the default version.
+        rope_scaling: Dictionary containing the scaling configuration for the
+            RoPE embeddings. When using this flag, don't update
+            `max_position_embeddings` to the expected new maximum.
+        tokenizer_revision: The specific tokenizer version to use. It can be a
+            branch name, a tag name, or a commit id. If unspecified, will use
+            the default version.
+        max_model_len: Maximum length of a sequence (including prompt and
+            output). If None, will be derived from the model.
+        quantization: Quantization method that was used to quantize the model
+            weights. If None, we assume the model weights are not quantized.
+        quantization_param_path: Path to JSON file containing scaling factors.
+            Used to load KV cache scaling factors into the model when KV cache
+            type is FP8_E4M3 on ROCm (AMD GPU). In the future these will also
+            be used to load activation and weight scaling factors when the
+            model dtype is FP8_E4M3 on ROCm.
+        enforce_eager: Whether to enforce eager execution. If True, we will
+            disable CUDA graph and always execute the model in eager mode.
+            If False, we will use CUDA graph and eager execution in hybrid.
+            If None, the user did not specify, so default to False.
+        max_context_len_to_capture: Maximum context len covered by CUDA graphs.
+            When a sequence has context length larger than this, we fall back
+            to eager mode (DEPRECATED. Use max_seq_len_to_capture instead).
+        max_seq_len_to_capture: Maximum sequence len covered by CUDA graphs.
+            When a sequence has context length larger than this, we fall back
+            to eager mode. Additionally for encoder-decoder models, if the
+            sequence length of the encoder input is larger than this, we fall
+            back to the eager mode.
+        disable_sliding_window: Whether to disable sliding window. If True,
+            we will disable the sliding window functionality of the model.
+            If the model does not support sliding window, this argument is
+            ignored.
+        skip_tokenizer_init: If true, skip initialization of tokenizer and
+            detokenizer.
+        served_model_name: The model name used in metrics tag `model_name`,
+            matches the model name exposed via the APIs. If multiple model
+            names provided, the first name will be used. If not specified,
+            the model name will be the same as `model`.
+        limit_mm_per_prompt: Maximum number of data instances per modality
+            per prompt. Only applicable for multimodal models.
+        override_neuron_config: Initialize non default neuron config or
+            override default neuron config that are specific to Neuron devices,
+            this argument will be used to configure the neuron config that
+            can not be gathered from the vllm arguments.
+        config_format: The config format which shall be loaded.
+            Defaults to 'auto' which defaults to 'hf'.
+        mm_processor_kwargs: Arguments to be forwarded to the model's processor
+            for multi-modal data, e.g., image processor.
+    """
+
+    def __init__(self,
+                 model: str,
+                 tokenizer: str,
+                 tokenizer_mode: str,
+                 trust_remote_code: bool,
+                 dtype: Union[str, torch.dtype],
+                 seed: int,
+                 revision: Optional[str] = None,
+                 code_revision: Optional[str] = None,
+                 rope_scaling: Optional[dict] = None,
+                 rope_theta: Optional[float] = None,
+                 tokenizer_revision: Optional[str] = None,
+                 max_model_len: Optional[int] = None,
+                 spec_target_max_model_len: Optional[int] = None,
+                 quantization: Optional[str] = None,
+                 quantization_param_path: Optional[str] = None,
+                 enforce_eager: Optional[bool] = None,
+                 max_context_len_to_capture: Optional[int] = None,
+                 max_seq_len_to_capture: Optional[int] = None,
+                 max_logprobs: int = 20,
+                 disable_sliding_window: bool = False,
+                 skip_tokenizer_init: bool = False,
+                 served_model_name: Optional[Union[str, List[str]]] = None,
+                 limit_mm_per_prompt: Optional[Mapping[str, int]] = None,
+                 use_async_output_proc: bool = True,
+                 override_neuron_config: Optional[Dict[str, Any]] = None,
+                 config_format: ConfigFormat = ConfigFormat.AUTO,
+                 mm_processor_kwargs: Optional[Dict[str, Any]] = None) -> None:
+        self.model = model
+        self.tokenizer = tokenizer
+        self.tokenizer_mode = tokenizer_mode
+        self.trust_remote_code = trust_remote_code
+        self.seed = seed
+        self.revision = revision
+        self.code_revision = code_revision
+        self.rope_scaling = rope_scaling
+        self.rope_theta = rope_theta
+        # The tokenizer version is consistent with the model version by default.
+        if tokenizer_revision is None:
+            self.tokenizer_revision = revision
+        else:
+            self.tokenizer_revision = tokenizer_revision
+        self.quantization = quantization
+        self.quantization_param_path = quantization_param_path
+        self.enforce_eager = enforce_eager
+        if max_context_len_to_capture is not None:
+            raise ValueError("`max_context_len_to_capture` is deprecated. "
+                             "Use `max_seq_len_to_capture` instead.")
+        self.max_seq_len_to_capture = max_seq_len_to_capture
+        self.max_logprobs = max_logprobs
+        self.disable_sliding_window = disable_sliding_window
+        self.skip_tokenizer_init = skip_tokenizer_init
+
+        self.hf_config = get_config(self.model, trust_remote_code, revision,
+                                    code_revision, rope_scaling, rope_theta,
+                                    config_format)
+        self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.hf_image_processor_config = get_hf_image_processor_config(
+            self.model, revision)
+        self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
+        self.use_async_output_proc = use_async_output_proc
+        self.mm_processor_kwargs = mm_processor_kwargs
+
+        # Set enforce_eager to False if the value is unset.
+        if self.enforce_eager is None:
+            self.enforce_eager = False
+
+        if (not self.disable_sliding_window
+                and self.hf_text_config.model_type == "gemma2"
+                and self.hf_text_config.sliding_window is not None):
+            print_warning_once(
+                "Gemma 2 uses sliding window attention for every odd layer, "
+                "which is currently not supported by vLLM. Disabling sliding "
+                "window and capping the max length to the sliding window size "
+                f"({self.hf_text_config.sliding_window}).")
+            self.disable_sliding_window = True
+
+        self.max_model_len = _get_and_verify_max_len(
+            hf_config=self.hf_text_config,
+            max_model_len=max_model_len,
+            disable_sliding_window=self.disable_sliding_window,
+            sliding_window_len=self.get_hf_config_sliding_window(),
+            spec_target_max_model_len=spec_target_max_model_len)
+        self.served_model_name = get_served_model_name(model,
+                                                       served_model_name)
+        self.multimodal_config = self._init_multimodal_config(
+            limit_mm_per_prompt)
+        if not self.skip_tokenizer_init:
+            self._verify_tokenizer_mode()
+
+        self.is_attention_free = self._init_attention_free()
+        self.has_inner_state = self._init_has_inner_state()
+
+        self.override_neuron_config = override_neuron_config if is_neuron(
+        ) else None
+        self._verify_embedding_mode()
+        self._verify_whisper_mode()
+        self._verify_quantization()
+        self._verify_cuda_graph()
+        self._verify_bnb_config()
+
+    def _init_multimodal_config(
+        self, limit_mm_per_prompt: Optional[Mapping[str, int]]
+    ) -> Optional["MultiModalConfig"]:
+        architectures = getattr(self.hf_config, "architectures", [])
+        if ModelRegistry.is_multimodal_model(architectures):
+            return MultiModalConfig(limit_per_prompt=limit_mm_per_prompt or {})
+
+        if limit_mm_per_prompt:
+            raise ValueError("`limit_mm_per_prompt` is only supported for "
+                             "multimodal models.")
+
+        return None
+
+    def _init_attention_free(self) -> bool:
+        architectures = getattr(self.hf_config, "architectures", [])
+        return ModelRegistry.is_attention_free_model(architectures)
+
+    def _init_has_inner_state(self) -> bool:
+        architectures = getattr(self.hf_config, "architectures", [])
+        return ModelRegistry.model_has_inner_state(architectures)
+
+    def _verify_tokenizer_mode(self) -> None:
+        tokenizer_mode = self.tokenizer_mode.lower()
+        if tokenizer_mode not in ["auto", "slow", "mistral"]:
+            raise ValueError(
+                f"Unknown tokenizer mode: {self.tokenizer_mode}. Must be "
+                "either 'auto', 'slow' or 'mistral'.")
+        self.tokenizer_mode = tokenizer_mode
+
+    def _verify_embedding_mode(self) -> None:
+        architectures = getattr(self.hf_config, "architectures", [])
+        self.embedding_mode = ModelRegistry.is_embedding_model(architectures)
+
+    def _verify_whisper_mode(self) -> None:
+        architectures = getattr(self.hf_config, "architectures", [])
+        self.whisper_mode = ModelRegistry.is_whisper_model(architectures)
+
+    def _parse_quant_hf_config(self):
+        quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if quant_cfg is None:
+            # compressed-tensors uses a "compression_config" key
+            quant_cfg = getattr(self.hf_config, "compression_config", None)
+        return quant_cfg
+
+    def _verify_quantization(self) -> None:
+        supported_quantization = [*QUANTIZATION_METHODS]
+        rocm_supported_quantization = [
+            "awq", "gptq", "fp8", "compressed_tensors", "compressed-tensors",
+            "fbgemm_fp8"
+        ]
+        optimized_quantization_methods = [
+            "fp8", "marlin", "modelopt", "gptq_marlin_24", "gptq_marlin",
+            "awq_marlin", "fbgemm_fp8", "compressed_tensors",
+            "compressed-tensors", "experts_int8"
+        ]
+        tpu_supported_quantization = ["tpu_int8"]
+        neuron_supported_quantization = ["neuron_quant"]
+        if self.quantization is not None:
+            self.quantization = self.quantization.lower()
+
+        # Parse quantization method from the HF model config, if available.
+        quant_cfg = self._parse_quant_hf_config()
+
+        if quant_cfg is not None:
+            quant_method = quant_cfg.get("quant_method", "").lower()
+
+            # Detect which checkpoint is it
+            for _, method in QUANTIZATION_METHODS.items():
+                quantization_override = method.override_quantization_method(
+                    quant_cfg, self.quantization)
+                if quantization_override:
+                    quant_method = quantization_override
+                    self.quantization = quantization_override
+                    break
+
+            # Verify quantization configurations.
+            if self.quantization is None:
+                self.quantization = quant_method
+            elif self.quantization != quant_method:
+                raise ValueError(
+                    "Quantization method specified in the model config "
+                    f"({quant_method}) does not match the quantization "
+                    f"method specified in the `quantization` argument "
+                    f"({self.quantization}).")
+
+        if self.quantization is not None:
+            if self.quantization not in supported_quantization:
+                raise ValueError(
+                    f"Unknown quantization method: {self.quantization}. Must "
+                    f"be one of {supported_quantization}.")
+            if is_hip(
+            ) and self.quantization not in rocm_supported_quantization:
+                raise ValueError(
+                    f"{self.quantization} quantization is currently not "
+                    f"supported in ROCm.")
+            if current_platform.is_tpu(
+            ) and self.quantization not in tpu_supported_quantization:
+                raise ValueError(
+                    f"{self.quantization} quantization is currently not "
+                    f"supported in TPU Backend.")
+            if self.quantization not in optimized_quantization_methods:
+                logger.warning(
+                    "%s quantization is not fully "
+                    "optimized yet. The speed can be slower than "
+                    "non-quantized models.", self.quantization)
+            if (self.quantization == "awq" and is_hip()
+                    and not envs.VLLM_USE_TRITON_AWQ):
+                logger.warning(
+                    "Using AWQ quantization with ROCm, but VLLM_USE_TRITON_AWQ"
+                    " is not set, enabling VLLM_USE_TRITON_AWQ.")
+                envs.VLLM_USE_TRITON_AWQ = True
+            if is_neuron(
+            ) and self.quantization not in neuron_supported_quantization:
+                raise ValueError(
+                    f"{self.quantization} quantization is currently not "
+                    f"supported in Neuron Backend.")
+
+    def _verify_cuda_graph(self) -> None:
+        if self.max_seq_len_to_capture is None:
+            self.max_seq_len_to_capture = self.max_model_len
+        self.max_seq_len_to_capture = min(self.max_seq_len_to_capture,
+                                          self.max_model_len)
+
+    def _verify_bnb_config(self) -> None:
+        """
+        The current version of bitsandbytes (0.44.0) with 8-bit models does not
+        yet support CUDA graph.
+        """
+        is_bitsandbytes = self.quantization == "bitsandbytes"
+        has_quantization_config = (getattr(self.hf_config,
+                                           "quantization_config", None)
+                                   is not None)
+        is_8bit = (self.hf_config.quantization_config.get(
+            "load_in_8bit", False) if has_quantization_config else False)
+        if all([
+                is_bitsandbytes,
+                has_quantization_config,
+                is_8bit,
+                not self.enforce_eager,
+        ]):
+            logger.warning(
+                "CUDA graph is not supported on BitAndBytes 8bit yet, "
+                "fallback to the eager mode.")
+            self.enforce_eager = True
+
+    def verify_async_output_proc(self, parallel_config, speculative_config,
+                                 device_config) -> None:
+        if not self.use_async_output_proc:
+            # Nothing to check
+            return
+
+        if parallel_config.pipeline_parallel_size > 1:
+            logger.warning("Async output processing can not be enabled "
+                           "with pipeline parallel")
+            self.use_async_output_proc = False
+            return
+
+        # Reminder: Please update docs/source/serving/compatibility_matrix.rst
+        # If the feature combo become valid
+        if device_config.device_type not in ("cuda", "tpu", "hpu"):
+            logger.warning(
+                "Async output processing is only supported for CUDA, TPU "
+                "and HPU. "
+                "Disabling it for other platforms.")
+            self.use_async_output_proc = False
+            return
+
+        if envs.VLLM_USE_RAY_SPMD_WORKER:
+            logger.warning(
+                "Async output processing can not be enabled with ray spmd")
+            self.use_async_output_proc = False
+            return
+
+        # Reminder: Please update docs/source/serving/compatibility_matrix.rst
+        # If the feature combo become valid
+        if device_config.device_type == "cuda" and self.enforce_eager:
+            logger.warning(
+                "To see benefits of async output processing, enable CUDA "
+                "graph. Since, enforce-eager is enabled, async output "
+                "processor cannot be used")
+            self.use_async_output_proc = not self.enforce_eager
+            return
+
+        # Async postprocessor is not necessary with embedding mode
+        # since there is no token generation
+        if self.embedding_mode:
+            self.use_async_output_proc = False
+
+        # Reminder: Please update docs/source/serving/compatibility_matrix.rst
+        # If the feature combo become valid
+        if speculative_config:
+            logger.warning("Async output processing is not supported with"
+                           " speculative decoding currently.")
+            self.use_async_output_proc = False
+
+    def verify_with_parallel_config(
+        self,
+        parallel_config: "ParallelConfig",
+    ) -> None:
+        total_num_attention_heads = getattr(self.hf_text_config,
+                                            "num_attention_heads", 0)
+        tensor_parallel_size = parallel_config.tensor_parallel_size
+        if total_num_attention_heads % tensor_parallel_size != 0:
+            raise ValueError(
+                f"Total number of attention heads ({total_num_attention_heads})"
+                " must be divisible by tensor parallel size "
+                f"({tensor_parallel_size}).")
+
+        pipeline_parallel_size = parallel_config.pipeline_parallel_size
+        if pipeline_parallel_size > 1:
+            architectures = getattr(self.hf_config, "architectures", [])
+            if not ModelRegistry.is_pp_supported_model(architectures):
+                raise NotImplementedError(
+                    "Pipeline parallelism is not supported for this model. "
+                    "Supported models implement the `SupportsPP` interface.")
+
+            if self.use_async_output_proc:
+                logger.warning("Async output processor is not supported with "
+                               "pipeline parallelism currently. Disabling it.")
+                self.use_async_output_proc = False
+
+    def get_hf_config_sliding_window(self) -> Optional[int]:
+        """Get the sliding window size, or None if disabled."""
+
+        # Some models, like Qwen2 and Qwen1.5, use `use_sliding_window` in
+        # addition to sliding window size. We check if that field is present
+        # and if it's False, return None.
+        if (hasattr(self.hf_text_config, "use_sliding_window")
+                and not self.hf_text_config.use_sliding_window):
+            return None
+        return getattr(self.hf_text_config, "sliding_window", None)
+
+    def get_sliding_window(self) -> Optional[int]:
+        """Get the sliding window size, or None if disabled.
+        """
+        # If user disables sliding window, return None.
+        if self.disable_sliding_window:
+            return None
+        # Otherwise get the value from the hf config.
+        return self.get_hf_config_sliding_window()
+
+    def get_vocab_size(self) -> int:
+        return self.hf_text_config.vocab_size
+
+    def get_hidden_size(self) -> int:
+        return self.hf_text_config.hidden_size
+
+    def get_head_size(self) -> int:
+        # TODO remove hard code
+        if hasattr(self.hf_text_config, "model_type"
+                   ) and self.hf_text_config.model_type == 'deepseek_v2':
+            # FlashAttention supports only head_size 32, 64, 128, 256,
+            # we need to pad head_size 192 to 256
+            return 256
+
+        if self.is_attention_free:
+            return 0
+
+        if hasattr(self.hf_text_config, "head_dim"):
+            return self.hf_text_config.head_dim
+        # FIXME(woosuk): This may not be true for all models.
+        return (self.hf_text_config.hidden_size //
+                self.hf_text_config.num_attention_heads)
+
+    def get_total_num_kv_heads(self) -> int:
+        """Returns the total number of KV heads."""
+        # For GPTBigCode & Falcon:
+        # NOTE: for falcon, when new_decoder_architecture is True, the
+        # multi_query flag is ignored and we use n_head_kv for the number of
+        # KV heads.
+        falcon_model_types = ["falcon", "RefinedWeb", "RefinedWebModel"]
+        new_decoder_arch_falcon = (
+            self.hf_config.model_type in falcon_model_types
+            and getattr(self.hf_config, "new_decoder_architecture", False))
+        if not new_decoder_arch_falcon and getattr(self.hf_text_config,
+                                                   "multi_query", False):
+            # Multi-query attention, only one KV head.
+            # Currently, tensor parallelism is not supported in this case.
+            return 1
+
+        # For DBRX and MPT
+        if self.hf_config.model_type == "mpt":
+            if "kv_n_heads" in self.hf_config.attn_config:
+                return self.hf_config.attn_config["kv_n_heads"]
+            return self.hf_config.num_attention_heads
+        if self.hf_config.model_type == "dbrx":
+            return getattr(self.hf_config.attn_config, "kv_n_heads",
+                           self.hf_config.num_attention_heads)
+
+        if self.is_attention_free:
+            return 0
+
+        attributes = [
+            # For Falcon:
+            "n_head_kv",
+            "num_kv_heads",
+            # For LLaMA-2:
+            "num_key_value_heads",
+            # For ChatGLM:
+            "multi_query_group_num",
+        ]
+        for attr in attributes:
+            num_kv_heads = getattr(self.hf_text_config, attr, None)
+            if num_kv_heads is not None:
+                return num_kv_heads
+
+        # For non-grouped-query attention models, the number of KV heads is
+        # equal to the number of attention heads.
+        return self.hf_text_config.num_attention_heads
+
+    def get_num_kv_heads(self, parallel_config: "ParallelConfig") -> int:
+        """Returns the number of KV heads per GPU."""
+        total_num_kv_heads = self.get_total_num_kv_heads()
+        # If tensor parallelism is used, we divide the number of KV heads by
+        # the tensor parallel size. We will replicate the KV heads in the
+        # case where the number of KV heads is smaller than the tensor
+        # parallel size so each GPU has at least one KV head.
+        return max(1,
+                   total_num_kv_heads // parallel_config.tensor_parallel_size)
+
+    def get_num_attention_heads(self,
+                                parallel_config: "ParallelConfig") -> int:
+        num_heads = getattr(self.hf_text_config, "num_attention_heads", 0)
+        return num_heads // parallel_config.tensor_parallel_size
+
+    def get_num_layers(self, parallel_config: "ParallelConfig") -> int:
+        from vllm.distributed.utils import get_pp_indices
+        total_num_hidden_layers = getattr(self.hf_text_config,
+                                          "num_hidden_layers", 0)
+        pp_rank = parallel_config.rank // parallel_config.tensor_parallel_size
+        pp_size = parallel_config.pipeline_parallel_size
+        start, end = get_pp_indices(total_num_hidden_layers, pp_rank, pp_size)
+        return end - start
+
+    def get_num_attention_layers(self,
+                                 parallel_config: "ParallelConfig") -> int:
+        if self.is_attention_free:
+            return 0
+
+        num_layers = self.get_num_layers(parallel_config)
+
+        # Transformers supports layers_block_type @property
+        layers = getattr(self.hf_config, "layers_block_type",
+                         ["attention"] * num_layers)
+        return len([t for t in layers if t == "attention"])
+
+    def get_multimodal_config(self) -> "MultiModalConfig":
+        """
+        Get the multimodal configuration of the model.
+
+        Raises:
+            ValueError: If the model is not multimodal.
+        """
+        if self.multimodal_config is None:
+            raise ValueError("The model is not multimodal.")
+
+        return self.multimodal_config
+
+    @property
+    def is_encoder_decoder_model(self) -> bool:
+        """Extract the HF encoder/decoder model flag."""
+        return getattr(self.hf_config, "is_encoder_decoder", False) or (
+            (hasattr(self.hf_config, "text_config") and getattr(
+                self.hf_config.text_config, "is_encoder_decoder", False)))
+
+    @property
+    def is_embedding_model(self) -> bool:
+        """Extract the embedding model flag."""
+        return self.embedding_mode
+
+    @property
+    def is_whisper_model(self) -> bool:
+        """Extract the embedding model flag."""
+        return self.whisper_mode
+
+    @property
+    def is_multimodal_model(self) -> bool:
+        return self.multimodal_config is not None
+
 
 class CacheConfig:
     """Configuration for the KV cache.
