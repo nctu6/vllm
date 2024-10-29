@@ -976,7 +976,7 @@ class SequenceGroupMetadata(
         multi_modal_data: Multi modal data.
         mm_processor_kwargs: Multimodal input processor / mapper overrides.
         encoder_seq_data: Optional sequence data for encoder prompt
-                          (SequenceGroup.encoder_seq). Should be None 
+                          (SequenceGroup.encoder_seq). Should be None
                           unless you are working with an encoder/decoder
                           model.
         cross_block_table: Optional cross-attention block table associated
@@ -986,59 +986,27 @@ class SequenceGroupMetadata(
                            model.
         prompt_adapter_request: Prompt Adapter request.
     """
-
-    def __init__(
-        self,
-	    request_id: str,
-	    is_prompt: bool,
-	    seq_data: Dict[int, SequenceData],
-	    sampling_params: Optional[SamplingParams],
-	    block_tables: Dict[int, List[int]],
-	    do_sample: bool = True,
-	    pooling_params: Optional[PoolingParams] = None,
-	    token_chunk_size: Optional[int] = None,
-	    lora_request: Optional[LoRARequest] = None,
-	    computed_block_nums: Optional[List[int]] = None,
-	    state: Optional[SequenceGroupState] = msgspec.field(
-	        default_factory=lambda: SequenceGroupState()),
-	    # "MultiModalDataDict" types. We have to use Any due to msgspec
-	    # doesn't allow to have union of 2 different dicts.
-	    multi_modal_data: Optional[Any] = None,
-        whisper_data: Optional["WhisperData"] = None,
-	    mm_processor_kwargs: Optional[Dict[str, Any]] = None,
-	    encoder_seq_data: Optional[SequenceData] = None,
-	    cross_block_table: Optional[List[int]] = None,
-	    prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-	    num_speculative_tokens: Optional[int] = None,	
-    ) -> None:
-        self.request_id = request_id
-        self.is_prompt = is_prompt
-        self.seq_data = seq_data
-        self.sampling_params = sampling_params
-        self.block_tables = block_tables
-        self.pooling_params = pooling_params
-        self.lora_request = lora_request
-        self.computed_block_nums = computed_block_nums
-        self.multi_modal_data = multi_modal_data
-        self.whisper_data = whisper_data
-        self.state = SequenceGroupState() if state is None else state
-        self.encoder_seq_data = encoder_seq_data
-        self.cross_block_table = cross_block_table
-        self.token_chunk_size = token_chunk_size
-        self.do_sample = do_sample
-	    ### Stateful fields that are lazily defined. ###
-	    # The number of speculative tokens adopted in this request.
-	    # None means specuative decoding is not used.
-	    # Zero means speculative decoding is disabled for some reasons.
-	    # TODO: We should maintain this states out of the sequence group.
-        self.num_speculative_tokens = num_speculative_tokens
-
-        if self.token_chunk_size is None:
-            if is_prompt:
-                self.token_chunk_size = list(seq_data.values())[0].get_len()
-            else:
-                self.token_chunk_size = 1
-
+    request_id: str
+    is_prompt: bool
+    seq_data: Dict[int, SequenceData]
+    sampling_params: Optional[SamplingParams]
+    block_tables: Dict[int, List[int]]
+    do_sample: bool = True
+    pooling_params: Optional[PoolingParams] = None
+    token_chunk_size: Optional[int] = None
+    lora_request: Optional[LoRARequest] = None
+    computed_block_nums: Optional[List[int]] = None
+    state: Optional[SequenceGroupState] = msgspec.field(
+        default_factory=lambda: SequenceGroupState())
+    # "MultiModalDataDict" types. We have to use Any due to msgspec
+    # doesn't allow to have union of 2 different dicts.
+    multi_modal_data: Optional[Any] = None
+    whisper_data: Optional["WhisperData"] = None
+    mm_processor_kwargs: Optional[Dict[str, Any]] = None
+    encoder_seq_data: Optional[SequenceData] = None
+    cross_block_table: Optional[List[int]] = None
+    prompt_adapter_request: Optional[PromptAdapterRequest] = None
+    num_speculative_tokens: Optional[int] = None
 
 
     def __post_init__(self):
