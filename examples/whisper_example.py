@@ -14,6 +14,8 @@ def main():
         max_model_len = 448,
         gpu_memory_utilization = 0.4,
         dtype = 'bfloat16',
+        whisper_input_type = 'input_features',
+        enforce_eager = True,
     )
 
     r = requests.get('https://github.com/mesolitica/malaya-speech/raw/master/speech/7021-79759-0004.wav')

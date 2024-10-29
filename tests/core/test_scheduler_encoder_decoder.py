@@ -2,7 +2,7 @@ from typing import List
 
 import pytest  # noqa
 
-from vllm.config import CacheConfig, SchedulerConfig
+from vllm.cache_config import CacheConfig, SchedulerConfig
 from vllm.core.scheduler import Scheduler
 from vllm.sequence import SequenceGroup
 

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 from torch import Use  # noqa
 
-from vllm.config import CacheConfig, LoRAConfig, SchedulerConfig
+from vllm.cache_config import CacheConfig, LoRAConfig, SchedulerConfig
 from vllm.core.interfaces import AllocStatus
 from vllm.core.scheduler import Scheduler, SchedulingBudget
 from vllm.lora.request import LoRARequest
