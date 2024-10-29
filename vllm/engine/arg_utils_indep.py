@@ -3,10 +3,11 @@ from typing import (TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional,
                     Tuple, Type, Union)
 
 import vllm.envs as envs
-from vllm.config import (CacheConfig, ConfigFormat, DecodingConfig,
-                         DeviceConfig, EngineConfig, LoadConfig, LoadFormat,
-                         LoRAConfig, ModelConfig, ObservabilityConfig,
-                         ParallelConfig, PromptAdapterConfig, SchedulerConfig,
+from vllm.config_indep CacheConfig, LoRAConfig, DeviceConfig, SchedulerConfig, ModelConfig, LoadConfig, ParallelConfig
+from vllm.config import (ConfigFormat, DecodingConfig,
+                         EngineConfig, LoadFormat,
+                         ObservabilityConfig,
+                         PromptAdapterConfig,
 						 SpeculativeConfig, TokenizerPoolConfig,
                          VisionLanguageConfig, WhisperConfig)
 from vllm.executor.executor_base import ExecutorBase
