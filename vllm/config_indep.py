@@ -4,6 +4,8 @@ from dataclasses import dataclass, field, fields
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple,
                     Union)
 
+import torch
+
 class CacheConfig:
     """Configuration for the KV cache.
 
