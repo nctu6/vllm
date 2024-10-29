@@ -5,9 +5,19 @@ from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Mapping,
                     Optional, Tuple, Type, Union)
 
 import torch
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.transformers_utils.config import (ConfigFormat, get_config,
                                             get_hf_image_processor_config,
                                             get_hf_text_config)
+
+logger = init_logger(__name__)
+
+_GB = 1 << 30
+_EMBEDDING_MODEL_MAX_NUM_BATCHED_TOKENS = 32768
+_WHISPER_MAX_NUM_BATCHED_TOKENS = 448
+_MULTIMODAL_MODEL_MAX_NUM_BATCHED_TOKENS = 5120
+
 
 class ModelConfig:
     """Configuration for the model.
@@ -820,4 +830,166 @@ class LoRAConfig:
         # If the feature combo become valid
         if scheduler_config.chunked_prefill_enabled:
             raise ValueError("LoRA is not supported with chunked prefill yet.")
+
+
+class SchedulerConfig:
+    """Scheduler configuration.
+
+    Args:
+        max_num_batched_tokens: Maximum number of tokens to be processed in
+            a single iteration.
+        max_num_seqs: Maximum number of sequences to be processed in a single
+            iteration.
+        max_num_prefill_seqs: Maximum number of prefill sequences to be
+             processed in a single iteration. Used only with padding-aware
+             scheduling.
+        max_model_len: Maximum length of a sequence (including prompt
+            and generated text).
+        use_v2_block_manager: Whether to use the BlockSpaceManagerV2 or not.
+        num_lookahead_slots: The number of slots to allocate per sequence per
+            step, beyond the known token ids. This is used in speculative
+            decoding to store KV activations of tokens which may or may not be
+            accepted.
+        delay_factor: Apply a delay (of delay factor multiplied by previous
+            prompt latency) before scheduling next prompt.
+        enable_chunked_prefill: If True, prefill requests can be chunked based
+            on the remaining max_num_batched_tokens.
+        embedding_mode: Whether the running model is for embedding.
+        preemption_mode: Whether to perform preemption by swapping or
+            recomputation. If not specified, we determine the mode as follows:
+            We use recomputation by default since it incurs lower overhead than
+            swapping. However, when the sequence group has multiple sequences
+            (e.g., beam search), recomputation is not currently supported. In
+            such a case, we use swapping instead.
+        send_delta_data: Private API. If used, scheduler sends delta data to
+            workers instead of an entire data. It should be enabled only
+            when SPMD worker architecture is enabled. I.e.,
+            VLLM_USE_RAY_SPMD_WORKER=1
+        policy: The scheduling policy to use. "fcfs" (default) or "priority".
+        use_padding_aware_scheduling: If True, scheduler will consider padded
+            tokens in prefill.
+    """
+
+    def __init__(self,
+                 max_num_batched_tokens: Optional[int],
+                 max_num_seqs: int,
+                 max_num_prefill_seqs: Optional[int],
+                 max_model_len: int,
+                 use_v2_block_manager: bool = True,
+                 num_lookahead_slots: int = 0,
+                 delay_factor: float = 0.0,
+                 enable_chunked_prefill: bool = False,
+                 embedding_mode: bool = False,
+                 whisper_mode: Optional[bool] = False,
+                 preemption_mode: Optional[str] = None,
+                 num_scheduler_steps: int = 1,
+                 multi_step_stream_outputs: bool = False,
+                 send_delta_data: bool = False,
+                 policy: str = "fcfs",
+                 use_padding_aware_scheduling=False) -> None:
+        if max_num_batched_tokens is None:
+            if enable_chunked_prefill:
+                if num_scheduler_steps > 1:
+                    # Multi-step Chunked-Prefill doesn't allow prompt-chunking
+                    # for now. Have max_num_batched_tokens set to max_model_len
+                    # so we don't reject sequences on account of a short
+                    # max_num_batched_tokens.
+                    max_num_batched_tokens = max(max_model_len, 2048)
+            else:
+                # If max_model_len is too short, use 2048 as the default value
+                # for higher throughput.
+                max_num_batched_tokens = max(max_model_len, 2048)
+
+            if whisper_mode:
+                    # It is the values that have the best balance between ITL
+                    # and TTFT on A100. Note it is not optimized for throughput.
+                max_num_batched_tokens = max(
+                    max_model_len, _WHISPER_MAX_NUM_BATCHED_TOKENS)
+            if embedding_mode:
+                # For embedding, choose specific value for higher throughput
+                max_num_batched_tokens = max(
+                    max_num_batched_tokens,
+                    _EMBEDDING_MODEL_MAX_NUM_BATCHED_TOKENS,
+                )
+            if is_multimodal_model:
+                # The value needs to be at least the number of multimodal tokens
+                max_num_batched_tokens = max(
+                    max_num_batched_tokens,
+                    _MULTIMODAL_MODEL_MAX_NUM_BATCHED_TOKENS,
+                )
+
+        self.max_num_batched_tokens = max_num_batched_tokens
+
+        if enable_chunked_prefill:
+            logger.info(
+                "Chunked prefill is enabled with max_num_batched_tokens=%d.",
+                self.max_num_batched_tokens)
+
+        self.max_num_seqs = max_num_seqs
+        self.max_num_prefill_seqs = max_num_prefill_seqs
+        self.max_model_len = max_model_len
+        self.use_v2_block_manager = use_v2_block_manager
+        self.num_lookahead_slots = num_lookahead_slots
+        self.delay_factor = delay_factor
+        self.chunked_prefill_enabled = enable_chunked_prefill
+        self.embedding_mode = embedding_mode
+        self.preemption_mode = preemption_mode
+        self.num_scheduler_steps = num_scheduler_steps
+        self.multi_step_stream_outputs = multi_step_stream_outputs
+        self.send_delta_data = send_delta_data
+        self.policy = policy
+        self.use_padding_aware_scheduling = use_padding_aware_scheduling
+        self._verify_args()
+
+    def _verify_args(self) -> None:
+        if (self.max_num_batched_tokens < self.max_model_len
+                and not self.chunked_prefill_enabled):
+            raise ValueError(
+                f"max_num_batched_tokens ({self.max_num_batched_tokens}) is "
+                f"smaller than max_model_len ({self.max_model_len}). "
+                "This effectively limits the maximum sequence length to "
+                "max_num_batched_tokens and makes vLLM reject longer "
+                "sequences. Please increase max_num_batched_tokens or "
+                "decrease max_model_len.")
+
+        if self.max_num_batched_tokens < self.max_num_seqs:
+            raise ValueError(
+                f"max_num_batched_tokens ({self.max_num_batched_tokens}) must "
+                "be greater than or equal to max_num_seqs "
+                f"({self.max_num_seqs}).")
+
+        if self.num_lookahead_slots < 0:
+            raise ValueError(
+                "num_lookahead_slots "
+                f"({self.num_lookahead_slots}) must be greater than or "
+                "equal to 0.")
+
+        if self.num_scheduler_steps < 1:
+            raise ValueError(
+                "num_scheduler_steps "
+                f"({self.num_scheduler_steps}) must be greater than or "
+                "equal to 1.")
+        if self.max_num_prefill_seqs is not None \
+            and not self.use_padding_aware_scheduling:
+            raise ValueError("max_num_prefill_seqs can be only "
+                             "used with padding-aware-scheduling. ")
+        if self.use_padding_aware_scheduling and self.chunked_prefill_enabled:
+            raise ValueError("Padding-aware scheduling currently "
+                             "does not work with chunked prefill ")
+
+        if (not self.use_v2_block_manager \
+            and not envs.VLLM_ALLOW_DEPRECATED_BLOCK_MANAGER_V1):
+            raise ValueError(
+                "The use of BlockSpaceManagerV1 is deprecated and will "
+                "be removed in a future release. Please switch to "
+                "BlockSpaceManagerV2 by setting --use-v2-block-manager to "
+                "True. If you wish to suppress this error temporarily, "
+                "you can set the environment variable "
+                "`VLLM_ALLOW_DEPRECATED_BLOCK_MANAGER_V1=1. If your use "
+                "case is not supported in BlockSpaceManagerV2, please "
+                "file an issue with detailed information.")
+
+    @property
+    def is_multi_step(self) -> bool:
+        return self.num_scheduler_steps > 1
 
