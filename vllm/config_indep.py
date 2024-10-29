@@ -97,3 +97,39 @@ class CacheConfig:
         elif cpu_memory_usage > 0.4 * total_cpu_memory:
             logger.warning("Possibly too large swap space. %s", msg)
 
+
+class DeviceConfig:
+    device: Optional[torch.device]
+
+    def __init__(self, device: str = "auto") -> None:
+        if device == "auto":
+            # Automated device type detection
+            if current_platform.is_cuda_alike():
+                self.device_type = "cuda"
+            elif is_neuron():
+                self.device_type = "neuron"
+            elif current_platform.is_hpu():
+                self.device_type = "hpu"
+            elif is_openvino():
+                self.device_type = "openvino"
+            elif current_platform.is_tpu():
+                self.device_type = "tpu"
+            elif current_platform.is_cpu():
+                self.device_type = "cpu"
+            elif is_xpu():
+                self.device_type = "xpu"
+            else:
+                raise RuntimeError("Failed to infer device type")
+        else:
+            # Device type is assigned explicitly
+            self.device_type = device
+
+        # Some device types require processing inputs on CPU
+        if self.device_type in ["neuron", "openvino"]:
+            self.device = torch.device("cpu")
+        elif self.device_type in ["tpu"]:
+            self.device = None
+        else:
+            # Set device with device type
+            self.device = torch.device(self.device_type)
+
