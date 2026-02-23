@@ -3,13 +3,36 @@
 cmake_minimum_required(VERSION 3.11)
 project(_turbomind LANGUAGES CXX CUDA)
 
-find_package(pybind11 CONFIG)
+find_package(pybind11 CONFIG QUIET)
 if(NOT pybind11_FOUND)
-    execute_process(COMMAND "pybind11-config" "--cmakedir"
-                    RESULT_VARIABLE _COMMAND_SUCCESS
-                    OUTPUT_VARIABLE pybind11_DIR
-                    OUTPUT_STRIP_TRAILING_WHITESPACE)
-    find_package(pybind11 CONFIG)
+    execute_process(
+      COMMAND "pybind11-config" "--cmakedir"
+      RESULT_VARIABLE _COMMAND_SUCCESS
+      OUTPUT_VARIABLE pybind11_DIR
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+    )
+    if(_COMMAND_SUCCESS EQUAL 0 AND NOT pybind11_DIR STREQUAL "")
+      list(APPEND CMAKE_PREFIX_PATH "${pybind11_DIR}")
+      find_package(pybind11 CONFIG QUIET)
+    endif()
+endif()
+
+if(NOT pybind11_FOUND)
+  include(FetchContent)
+  FetchContent_Declare(
+    pybind11
+    GIT_REPOSITORY https://github.com/pybind/pybind11.git
+    GIT_TAG v2.13.6
+    GIT_SHALLOW ON
+    GIT_PROGRESS TRUE
+    USES_TERMINAL_DOWNLOAD TRUE
+  )
+  FetchContent_MakeAvailable(pybind11)
+endif()
+
+if(NOT COMMAND pybind11_add_module)
+  message(FATAL_ERROR "pybind11_add_module is unavailable after pybind11 setup.")
 endif()
 
 pybind11_add_module(${PROJECT_NAME} bind.cpp)

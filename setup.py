@@ -73,8 +73,29 @@ def is_ccache_available() -> bool:
     return which("ccache") is not None
 
 
-def is_ninja_available() -> bool:
-    return which("ninja") is not None
+def _find_working_ninja() -> str | None:
+    candidates = []
+    ninja_from_path = which("ninja")
+    if ninja_from_path:
+        candidates.append(ninja_from_path)
+    for fallback in ("/usr/bin/ninja", "/bin/ninja"):
+        if fallback not in candidates:
+            candidates.append(fallback)
+
+    for candidate in candidates:
+        if not os.path.isfile(candidate) or not os.access(candidate, os.X_OK):
+            continue
+        try:
+            subprocess.run(
+                [candidate, "--version"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return candidate
+        except (OSError, subprocess.CalledProcessError):
+            continue
+    return None
 
 
 def is_freethreaded():
@@ -176,6 +197,22 @@ class CMakeExtension(Extension):
 class cmake_build_ext(build_ext):
     # A dict of extension directories that have been configured.
     did_config: dict[str, bool] = {}
+
+    @staticmethod
+    def _has_stale_pip_build_env_refs(build_temp: str) -> bool:
+        cache_path = os.path.join(build_temp, "CMakeCache.txt")
+        if not os.path.isfile(cache_path):
+            return False
+        try:
+            cache_text = Path(cache_path).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return False
+
+        # pip isolated build envs are ephemeral (/tmp/pip-build-env-<id>).
+        # If CMake cache still references a removed env, Ninja can fail with
+        # missing torch libs from that old path.
+        pip_env_dirs = set(re.findall(r"/tmp/pip-build-env-[^/\\s]+", cache_text))
+        return any(not os.path.isdir(env_dir) for env_dir in pip_env_dirs)
 
     #
     # Determine number of compilation jobs and optionally nvcc compile threads.
@@ -283,9 +320,11 @@ class cmake_build_ext(build_ext):
         if nvcc_threads:
             cmake_args += ["-DNVCC_THREADS={}".format(nvcc_threads)]
 
-        if is_ninja_available():
+        ninja_executable = _find_working_ninja()
+        if ninja_executable is not None:
             build_tool = ["-G", "Ninja"]
             cmake_args += [
+                f"-DCMAKE_MAKE_PROGRAM={ninja_executable}",
                 "-DCMAKE_JOB_POOL_COMPILE:STRING=compile",
                 "-DCMAKE_JOB_POOLS:STRING=compile={}".format(num_jobs),
             ]
@@ -318,6 +357,14 @@ class cmake_build_ext(build_ext):
             subprocess.check_output(["cmake", "--version"])
         except OSError as e:
             raise RuntimeError("Cannot find CMake executable") from e
+
+        if self._has_stale_pip_build_env_refs(self.build_temp):
+            logger.warning(
+                "Removing stale CMake build directory %s due to dead "
+                "pip-build-env references.",
+                self.build_temp,
+            )
+            shutil.rmtree(self.build_temp, ignore_errors=True)
 
         # Create build directory if it does not exist.
         if not os.path.exists(self.build_temp):
