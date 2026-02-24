@@ -222,9 +222,9 @@ class TurboMindRuntime:
         vllm_config: VllmConfig,
     ) -> None:
         _require_turbomind()
-        self.model_dir = model_dir
-        self.engine_config = engine_config
         self.vllm_config = vllm_config
+        self.model_dir = self._resolve_model_dir(model_dir)
+        self.engine_config = engine_config
         self._use_in_memory_weights = False
         self._tm_model = None
         self.config_dict = self._load_config()
@@ -236,6 +236,61 @@ class TurboMindRuntime:
             self._load_weights_from_dir()
         self._process_weights()
         self._create_engine()
+
+    @staticmethod
+    def _is_hf_repo_id(model_dir: str) -> bool:
+        # Hub repo ids follow `namespace/repo_name`.
+        if model_dir.startswith(("/", ".", "~")):
+            return False
+        parts = model_dir.split("/")
+        return len(parts) == 2 and all(parts)
+
+    def _resolve_model_dir(self, model_dir: str) -> str:
+        if os.path.exists(model_dir):
+            return model_dir
+
+        if not self._is_hf_repo_id(model_dir):
+            return model_dir
+
+        try:
+            from lmdeploy.utils import get_model
+        except Exception:
+            logger.exception(
+                "TurboMind backend: failed to import lmdeploy hub downloader. "
+                "Proceeding with unresolved model path `%s`.",
+                model_dir,
+            )
+            return model_dir
+
+        download_dir = self.vllm_config.load_config.download_dir
+        revision = self.vllm_config.model_config.revision
+        token = self.vllm_config.model_config.hf_token
+        try:
+            resolved = get_model(
+                model_dir,
+                download_dir=download_dir,
+                revision=revision,
+                token=token,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "TurboMind backend: failed to download model "
+                f"`{model_dir}` from hub. Set `--hf-token` for private repos "
+                "or pass a local model path."
+            ) from exc
+
+        if not resolved or not os.path.exists(resolved):
+            raise RuntimeError(
+                "TurboMind backend: hub download returned invalid path "
+                f"for `{model_dir}`: `{resolved}`"
+            )
+
+        logger.info(
+            "TurboMind backend: resolved hub model `%s` to local path `%s`.",
+            model_dir,
+            resolved,
+        )
+        return resolved
 
     def _load_config(self) -> dict[str, Any]:
         config_path = os.path.join(self.model_dir, "config.yaml")
