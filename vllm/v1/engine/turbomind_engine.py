@@ -1509,6 +1509,31 @@ class TurbomindEngineClient(EngineClient):
         config.enable_metrics = False
         return config
 
+    def _get_tokenizer_eos_token_ids(self) -> list[int]:
+        tokenizer = self.input_processor.tokenizer
+        eos_ids: list[int] = []
+        if tokenizer is None:
+            return eos_ids
+
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if isinstance(eos_token_id, int):
+            eos_ids.append(int(eos_token_id))
+        elif isinstance(eos_token_id, (list, tuple, set)):
+            eos_ids.extend(int(x) for x in eos_token_id if isinstance(x, (int, np.integer)))
+
+        eos_token_ids = getattr(tokenizer, "eos_token_ids", None)
+        if isinstance(eos_token_ids, (list, tuple, set)):
+            eos_ids.extend(int(x) for x in eos_token_ids if isinstance(x, (int, np.integer)))
+        elif isinstance(eos_token_ids, int):
+            eos_ids.append(int(eos_token_ids))
+
+        # Preserve order while deduplicating.
+        unique: list[int] = []
+        for tok_id in eos_ids:
+            if tok_id not in unique:
+                unique.append(tok_id)
+        return unique
+
     def _sampling_params_to_tm_config(
         self, params: SamplingParams
     ) -> tuple[Any, list[int]]:
@@ -1555,17 +1580,22 @@ class TurbomindEngineClient(EngineClient):
             )
 
         stop_token_ids = list(params.stop_token_ids or [])
-        strict_lmdeploy_stop = os.getenv("VLLM_TURBOMIND_STRICT_LMDEPLOY_STOP", "1").lower() in (
+        all_stop_token_ids = sorted(set(getattr(params, "all_stop_token_ids", set()) or set()))
+        strict_lmdeploy_stop = os.getenv("VLLM_TURBOMIND_STRICT_LMDEPLOY_STOP", "0").lower() in (
             "1",
             "true",
             "yes",
             "on",
         )
         if not strict_lmdeploy_stop:
-            all_stop_token_ids = set(getattr(params, "all_stop_token_ids", set()) or set())
             if not params.ignore_eos:
-                all_stop_token_ids.update(stop_token_ids)
-                stop_token_ids = sorted(all_stop_token_ids)
+                stop_token_ids = sorted(set(all_stop_token_ids).union(stop_token_ids))
+
+        # Always ensure EOS fallback exists when caller did not provide stop
+        # token ids. This prevents unbounded generation in stream mode.
+        if not stop_token_ids and not params.ignore_eos:
+            stop_token_ids = self._get_tokenizer_eos_token_ids()
+
         if stop_token_ids:
             cfg.eos_ids = stop_token_ids
             if not params.ignore_eos:
