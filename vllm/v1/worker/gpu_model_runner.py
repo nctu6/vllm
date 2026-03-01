@@ -155,6 +155,11 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.ngram_eagle3 import (
+    draft_token_ids_list_to_padded_tensor,
+    merge_ngram_first_drafts,
+    sampled_token_ids_list_to_padded_tensor,
+)
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
@@ -442,6 +447,7 @@ class GPUModelRunner(
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
         # layers in the draft model.
+        self.ngram_drafter: NgramProposer | None = None  # type: ignore[name-defined]
         if self.speculative_config and get_pp_group().is_last_rank:
             self.drafter: (
                 NgramProposer  # noqa: F823
@@ -477,6 +483,10 @@ class GPUModelRunner(
                     "Unknown speculative decoding method: "
                     f"{self.speculative_config.method}"
                 )
+            if self.speculative_config.use_ngram_drafter():
+                from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+
+                self.ngram_drafter = NgramProposer(self.vllm_config)
             self.rejection_sampler = RejectionSampler(self.sampler)
 
         self.num_spec_tokens = 0
@@ -2944,8 +2954,13 @@ class GPUModelRunner(
             # when preparing inputs.
             # With spec decoding, this is done in propose_draft_token_ids().
             if self.input_batch.prev_sampled_token_ids is None:
-                assert sampled_token_ids.shape[-1] == 1
-                self.input_batch.prev_sampled_token_ids = sampled_token_ids
+                if sampled_token_ids.shape[-1] == 1:
+                    self.input_batch.prev_sampled_token_ids = sampled_token_ids
+                else:
+                    # Speculative decoding can emit multiple sampled columns.
+                    # Keep the first column as a safe placeholder until the
+                    # drafter path updates this tensor for the next step.
+                    self.input_batch.prev_sampled_token_ids = sampled_token_ids[:, :1]
             self.input_batch.prev_req_id_to_index = {
                 req_id: i
                 for i, req_id in enumerate(self.input_batch.req_ids)
@@ -3674,7 +3689,21 @@ class GPUModelRunner(
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
-                self._draft_token_ids = self.propose_draft_token_ids(
+                if (
+                    isinstance(sampled_token_ids, list)
+                    and len(sampled_token_ids) == 0
+                    and len(self.input_batch.req_ids) > 0
+                ):
+                    self._draft_token_ids = torch.zeros(
+                        (len(self.input_batch.req_ids), self.num_spec_tokens),
+                        device=self.device,
+                        dtype=torch.int32,
+                    )
+                    self._copy_draft_token_ids_to_cpu(
+                        scheduler_output, zeros_only=True
+                    )
+                    return
+                draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
                     sampled_token_ids,
                     self.input_batch.sampling_metadata,
@@ -3685,6 +3714,28 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata,
                     slot_mappings,
                 )
+                if isinstance(draft_token_ids, list):
+                    num_reqs = len(self.input_batch.req_ids)
+                    if len(draft_token_ids) < num_reqs:
+                        draft_token_ids = draft_token_ids + (
+                            [[]] * (num_reqs - len(draft_token_ids))
+                        )
+                    elif len(draft_token_ids) > num_reqs:
+                        draft_token_ids = draft_token_ids[:num_reqs]
+                    draft_token_ids = draft_token_ids_list_to_padded_tensor(
+                        draft_token_ids, self.num_spec_tokens, self.device
+                    )
+                if (
+                    isinstance(draft_token_ids, torch.Tensor)
+                    and draft_token_ids.shape[0] == 0
+                    and len(self.input_batch.req_ids) > 0
+                ):
+                    draft_token_ids = torch.zeros(
+                        (len(self.input_batch.req_ids), self.num_spec_tokens),
+                        device=self.device,
+                        dtype=torch.int32,
+                    )
+                self._draft_token_ids = draft_token_ids
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
@@ -3696,7 +3747,10 @@ class GPUModelRunner(
             )
             use_gpu_toks = (
                 spec_config.use_eagle() or spec_config.uses_draft_model()
-            ) and not spec_config.disable_padded_drafter_batch
+            ) and (
+                not spec_config.disable_padded_drafter_batch
+                and self.ngram_drafter is None
+            )
             if use_gpu_toks:
                 # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
                 # as inputs, and does not need to wait for bookkeeping to finish.
@@ -3725,7 +3779,11 @@ class GPUModelRunner(
                     ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                     self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
             else:
-                propose_drafts_after_bookkeeping = input_fits_in_drafter
+                # Ngram proposer works on CPU-side sampled tokens, and can
+                # still be used even when the model-based drafter is skipped.
+                propose_drafts_after_bookkeeping = (
+                    input_fits_in_drafter or self.ngram_drafter is not None
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
@@ -3981,6 +4039,35 @@ class GPUModelRunner(
             )
         elif spec_config.use_eagle() or spec_config.uses_draft_model():
             assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+            ngram_draft_token_ids: list[list[int]] | None = None
+            sampled_token_ids_for_merge: list[list[int]] | None = None
+            if self.ngram_drafter is not None:
+                assert isinstance(sampled_token_ids, list), (
+                    "sampled_token_ids should be a python list when ngram "
+                    "drafting is enabled."
+                )
+                sampled_token_ids_for_merge = sampled_token_ids
+                ngram_draft_token_ids = self.ngram_drafter.propose(
+                    sampled_token_ids,
+                    self.input_batch.num_tokens_no_spec,
+                    self.input_batch.token_ids_cpu,
+                    slot_mappings=slot_mappings,
+                )
+                # Fast path: all valid requests are served by ngram proposals.
+                if all(
+                    ngram_ids or not sampled_ids
+                    for ngram_ids, sampled_ids in zip(
+                        ngram_draft_token_ids, sampled_token_ids
+                    )
+                ):
+                    return ngram_draft_token_ids
+
+                input_fits_in_drafter = (
+                    common_attn_metadata.max_seq_len + self.num_spec_tokens
+                    <= self.effective_drafter_max_model_len
+                )
+                if not input_fits_in_drafter:
+                    return ngram_draft_token_ids
 
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
@@ -4001,6 +4088,12 @@ class GPUModelRunner(
                 # the gpu tensor of sampled tokens for each request, of shape
                 # (num_reqs, num_spec_tokens + 1) with rejected tokens having
                 # value -1.
+                if isinstance(sampled_token_ids, list):
+                    sampled_token_ids = sampled_token_ids_list_to_padded_tensor(
+                        sampled_token_ids,
+                        self.num_spec_tokens,
+                        self.device,
+                    )
                 assert isinstance(sampled_token_ids, torch.Tensor), (
                     "sampled_token_ids should be a torch.Tensor when"
                     "padded-batch is enabled."
@@ -4090,6 +4183,15 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
+            if (
+                ngram_draft_token_ids is not None
+                and sampled_token_ids_for_merge is not None
+            ):
+                draft_token_ids = merge_ngram_first_drafts(
+                    sampled_token_ids_for_merge,
+                    ngram_draft_token_ids,
+                    draft_token_ids,
+                )
 
         return draft_token_ids
 

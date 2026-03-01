@@ -752,6 +752,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self,
         input_batch: InputBatch,
         last_hidden_states: torch.Tensor,
+        sampled_tokens: torch.Tensor,
         aux_hidden_states: list[torch.Tensor] | None,
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
@@ -767,6 +768,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.next_prefill_tokens,
             self.sampler.sampling_states.temperature.gpu,
             self.sampler.sampling_states.seeds.gpu,
+            sampled_tokens=sampled_tokens,
+            req_ids=input_batch.req_ids,
+            idx_mapping_np=input_batch.idx_mapping_np,
+            prefill_token_ids=self.req_states.prefill_token_ids.gpu,
+            prefill_len=self.req_states.prefill_len.np,
         )
         return draft_tokens
 
@@ -939,6 +945,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             draft_tokens = self.propose_draft(
                 input_batch,
                 hidden_states,
+                sampler_output.sampled_token_ids,
                 None,  # aux_hidden_states
                 num_sampled,
                 num_rejected,

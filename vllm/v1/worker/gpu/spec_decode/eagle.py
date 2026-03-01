@@ -198,6 +198,11 @@ class EagleSpeculator:
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
+        sampled_tokens: torch.Tensor | None = None,
+        req_ids: list[str] | None = None,
+        idx_mapping_np: Any | None = None,
+        prefill_token_ids: torch.Tensor | None = None,
+        prefill_len: Any | None = None,
     ) -> torch.Tensor:
         # NOTE(woosuk): To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of eagle's input_ids and

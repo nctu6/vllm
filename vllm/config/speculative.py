@@ -46,6 +46,7 @@ MTPModelTypes = Literal[
 EagleModelTypes = Literal["eagle", "eagle3", MTPModelTypes]
 SpeculativeMethod = Literal[
     "ngram",
+    "ngram_eagle3",
     "medusa",
     "mlp_speculator",
     "draft_model",
@@ -74,7 +75,8 @@ class SpeculativeConfig:
     if possible, if `model` param is not provided, the method name must be
     provided.
 
-    If using `ngram` method, the related configuration `prompt_lookup_max` and
+    If using `ngram` or `ngram_eagle3` method, the related configuration
+    `prompt_lookup_max` and
     `prompt_lookup_min` should be considered."""
     draft_tensor_parallel_size: int | None = Field(default=None, ge=1)
     """The degree of the tensor parallelism for the draft model. Can only be 1
@@ -117,6 +119,10 @@ class SpeculativeConfig:
     prompt_lookup_min: int | None = Field(default=None, ge=1)
     """Minimum size of ngram token window when using Ngram proposer, if
     provided. Defaults to 1."""
+    enable_ngram_drafter: bool = True
+    """Enable a lightweight Ngram proposer for model-based speculative
+    decoding. When enabled, Ngram drafts are attempted first and model-based
+    drafting is used as fallback for misses."""
 
     speculative_token_tree: str | None = None
     """Specifies the tree structure for speculative token generation.
@@ -284,6 +290,11 @@ class SpeculativeConfig:
         # can not be detected, it will be considered as the "draft_model" by
         # default.
 
+        if self.method == "ngram_eagle3":
+            # Composite mode: Ngram-first + Eagle3 fallback.
+            self.method = "eagle3"
+            self.enable_ngram_drafter = True
+
         if self.method in get_args(MTPModelTypes) and self.method != "mtp":
             logger.warning(
                 "method `%s` is deprecated and replaced with mtp.", self.method
@@ -323,32 +334,7 @@ class SpeculativeConfig:
         if self.method in ("ngram", "[ngram]"):
             # Unified to "ngram" internally
             self.method = "ngram"
-            # Set default values if not provided
-            if self.prompt_lookup_min is None and self.prompt_lookup_max is None:
-                # TODO(woosuk): Tune these values. They are arbitrarily chosen.
-                self.prompt_lookup_min = 5
-                self.prompt_lookup_max = 5
-            elif self.prompt_lookup_min is None:
-                if self.prompt_lookup_max is None:
-                    raise ValueError(
-                        "Either prompt_lookup_max or prompt_lookup_min must be "
-                        "provided when using the ngram method."
-                    )
-                self.prompt_lookup_min = self.prompt_lookup_max
-            elif self.prompt_lookup_max is None:
-                if self.prompt_lookup_min is None:
-                    raise ValueError(
-                        "Either prompt_lookup_max or prompt_lookup_min must be "
-                        "provided when using the ngram method."
-                    )
-                self.prompt_lookup_max = self.prompt_lookup_min
-
-            # Validate values
-            if self.prompt_lookup_min > self.prompt_lookup_max:
-                raise ValueError(
-                    f"prompt_lookup_min={self.prompt_lookup_min} must "
-                    f"be <= prompt_lookup_max={self.prompt_lookup_max}"
-                )
+            self._set_ngram_prompt_lookup_defaults()
 
             # TODO: current we still need extract vocab_size from target model
             # config, in future, we may try refactor it out, and set
@@ -516,6 +502,8 @@ class SpeculativeConfig:
                         self.target_parallel_config, self.draft_tensor_parallel_size
                     )
                 )
+            if self.use_ngram_drafter():
+                self._set_ngram_prompt_lookup_defaults()
         return self
 
     def _validate_suffix_decoding(self):
@@ -705,6 +693,33 @@ class SpeculativeConfig:
         self.verify_equal_vocab_size_if_draft_model()
         return self
 
+    def _set_ngram_prompt_lookup_defaults(self) -> None:
+        # TODO(woosuk): Tune these values. They are arbitrarily chosen.
+        if self.prompt_lookup_min is None and self.prompt_lookup_max is None:
+            self.prompt_lookup_min = 5
+            self.prompt_lookup_max = 5
+        elif self.prompt_lookup_min is None:
+            if self.prompt_lookup_max is None:
+                raise ValueError(
+                    "Either prompt_lookup_max or prompt_lookup_min must be "
+                    "provided when using ngram drafting."
+                )
+            self.prompt_lookup_min = self.prompt_lookup_max
+        elif self.prompt_lookup_max is None:
+            if self.prompt_lookup_min is None:
+                raise ValueError(
+                    "Either prompt_lookup_max or prompt_lookup_min must be "
+                    "provided when using ngram drafting."
+                )
+            self.prompt_lookup_max = self.prompt_lookup_min
+
+        # Validate values.
+        if self.prompt_lookup_min > self.prompt_lookup_max:
+            raise ValueError(
+                f"prompt_lookup_min={self.prompt_lookup_min} must "
+                f"be <= prompt_lookup_max={self.prompt_lookup_max}"
+            )
+
     def verify_equal_vocab_size_if_draft_model(self):
         if (
             self.method == "draft_model"
@@ -728,8 +743,15 @@ class SpeculativeConfig:
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"
 
+    def use_ngram_drafter(self) -> bool:
+        return self.enable_ngram_drafter and (self.use_eagle() or self.uses_draft_model())
+
     def __repr__(self) -> str:
         method = self.method
         model = None if method in ("ngram", "suffix") else self.draft_model_config.model
         num_spec_tokens = self.num_speculative_tokens
-        return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"
+        use_ngram_drafter = self.use_ngram_drafter()
+        return (
+            "SpeculativeConfig("
+            f"{method=}, {model=}, {num_spec_tokens=}, {use_ngram_drafter=})"
+        )
