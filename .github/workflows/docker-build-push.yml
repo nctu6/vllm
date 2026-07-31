@@ -6,7 +6,7 @@ on:
       - main
 
 env:
-  DOCKERHUB_REPO: ${{ vars.DOCKERHUB_REPO || 'your-dockerhub-user/vllm-openai' }}
+  DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_REPO }}
 
 jobs:
   build-and-push:
