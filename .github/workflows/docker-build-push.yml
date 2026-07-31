@@ -19,8 +19,15 @@ jobs:
 
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/graalvm /usr/local/share/powershell /usr/local/share/chromium \
+            /usr/local/lib/node_modules /opt/hostedtoolcache
+          sudo apt-get remove -y '^dotnet-.*' '^llvm-.*' 'php.*' azure-cli \
+            google-cloud-cli microsoft-edge-stable google-chrome-stable firefox \
+            powershell mono-devel || true
+          sudo apt-get autoremove -y
           sudo apt-get clean
+          sudo docker system prune -af
           df -h
 
       - name: Set up Docker Buildx
@@ -40,6 +47,8 @@ jobs:
 
       - name: Build and push
         uses: docker/bake-action@v6
+        env:
+          TORCH_CUDA_ARCH_LIST: "9.0 10.0 11.0 12.0"
         with:
           source: .
           files: |
