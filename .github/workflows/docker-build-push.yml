@@ -14,6 +14,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Free disk space
         run: |
@@ -39,6 +41,7 @@ jobs:
       - name: Build and push
         uses: docker/bake-action@v6
         with:
+          source: .
           files: |
             docker/docker-bake.hcl
             docker/versions.json
