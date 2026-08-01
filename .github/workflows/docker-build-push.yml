@@ -45,12 +45,23 @@ jobs:
             docker/docker-bake.hcl
             docker/versions.json
           targets: openai
-          push: true
+          push: false
+          load: true
           set: |
-            openai.tags=${{ env.DOCKERHUB_REPO }}:latest
-            openai.tags=${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.sha_short }}
-            openai.tags=${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.date }}
+            openai.tags=vllm-base:local
             *.args.max_jobs=64
             *.args.nvcc_threads=4
             *.args.RUN_WHEEL_CHECK=false
             openai.annotations=
+
+      - name: Install extra packages and push
+        run: |
+          cat <<'EOF' | docker build -t ${{ env.DOCKERHUB_REPO }}:latest -
+          FROM vllm-base:local
+          RUN pip install --no-cache-dir "vllm[audio]" msgpack
+          EOF
+          docker tag ${{ env.DOCKERHUB_REPO }}:latest ${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.sha_short }}
+          docker tag ${{ env.DOCKERHUB_REPO }}:latest ${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.date }}
+          docker push ${{ env.DOCKERHUB_REPO }}:latest
+          docker push ${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.sha_short }}
+          docker push ${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.date }}
