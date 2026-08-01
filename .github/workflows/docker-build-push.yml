@@ -52,7 +52,6 @@ jobs:
             *.args.max_jobs=64
             *.args.nvcc_threads=4
             *.args.RUN_WHEEL_CHECK=false
-            openai.annotations=
 
       - name: Install extra packages and push
         run: |

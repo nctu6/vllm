@@ -84,9 +84,7 @@ target "_labels" {
     "ai.vllm.build.url"                    = VLLM_BUILD_URL
     "ai.vllm.image.tag"                    = VLLM_IMAGE_TAG
   }
-  annotations = [
-    "index,manifest:org.opencontainers.image.revision=${VLLM_BUILD_COMMIT != "unknown" ? VLLM_BUILD_COMMIT : (COMMIT != "" ? COMMIT : "unknown")}",
-  ]
+  annotations = []
 }
 
 # Build targets
