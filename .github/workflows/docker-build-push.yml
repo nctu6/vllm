@@ -11,6 +11,7 @@ env:
 jobs:
   build-and-push:
     runs-on: self-hosted
+    timeout-minutes: 720
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,6 +37,8 @@ jobs:
         uses: docker/bake-action@v6
         env:
           TORCH_CUDA_ARCH_LIST: "9.0 10.0 11.0 12.0"
+          MAX_JOBS: "64"
+          NVCC_THREADS: "4"
         with:
           source: .
           files: |
@@ -47,3 +50,5 @@ jobs:
             openai.tags=${{ env.DOCKERHUB_REPO }}:latest
             openai.tags=${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.sha_short }}
             openai.tags=${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.date }}
+            *.args.max_jobs=64
+            *.args.nvcc_threads=4
