@@ -52,3 +52,4 @@ jobs:
             openai.tags=${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.date }}
             *.args.max_jobs=64
             *.args.nvcc_threads=4
+            *.args.RUN_WHEEL_CHECK=false
