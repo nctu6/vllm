@@ -36,6 +36,9 @@ run_build() {
     return 1
   fi
 
+  # 1. Populate the submodule on the host
+  git submodule update --init --recursive
+
   DOCKER_BUILDKIT=1 docker build \
     --cpuset-cpus="${CPU_SET}" \
     --progress=plain \
