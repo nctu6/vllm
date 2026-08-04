@@ -30,8 +30,7 @@ jobs:
       - name: Extract metadata
         id: meta
         run: |
-          echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "sha_date=$(git rev-parse --short HEAD)-$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/bake-action@v6
@@ -59,8 +58,13 @@ jobs:
           FROM vllm-base:local
           RUN pip install --no-cache-dir "vllm[audio]" msgpack
           EOF
-          docker tag ${{ env.DOCKERHUB_REPO }}:latest ${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.sha_short }}
-          docker tag ${{ env.DOCKERHUB_REPO }}:latest ${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.date }}
+          docker tag ${{ env.DOCKERHUB_REPO }}:latest ${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.sha_date }}
           docker push ${{ env.DOCKERHUB_REPO }}:latest
-          docker push ${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.sha_short }}
-          docker push ${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.date }}
+          docker push ${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.sha_date }}
+
+      - name: Run PyArmor and push secure image
+        continue-on-error: true
+        run: |
+          /workspace/nctu6/autobuild/autobuild-service/pyarmor-tools/run_pyarmor.sh \
+            "${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.sha_date }}" \
+            "nctu6/unieinfra-build-secure"
