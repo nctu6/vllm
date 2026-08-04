@@ -1,2 +1,0 @@
-# linting and formatting
-pre-commit==4.6.0

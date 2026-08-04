@@ -1,1 +1,0 @@
-../../../lmcache/usage_telemetry/README.md
