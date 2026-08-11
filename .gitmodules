@@ -1,3 +1,6 @@
 [submodule "rust"]
 	path = rust
 	url = https://github.com/Inferact/vllm-frontend-rs.git
+[submodule "lmcache"]
+	path = lmcache
+	url = https://github.com/LMCache/LMCache.git
