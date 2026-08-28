@@ -1,136 +1,102 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for WorkspaceManager.
 
-Focused on the lock semantics that turboquant_attn._decode_attention
-depends on: a locked workspace that is already large enough must still
-hand out tensor views, while a locked workspace that would need to grow
-must return None (via try_get_simultaneous) instead of raising — so the
-caller can fall back to per-call allocation. Repros the failure mode in
-vllm-project/vllm#42544.
-"""
-
-from unittest.mock import patch
+from typing import cast
 
 import pytest
 import torch
 
-from vllm.v1.worker.workspace import WorkspaceManager
+import vllm.v1.worker.workspace as workspace
+from vllm.config import VllmConfig
+from vllm.v1.worker.gpu_worker import _num_workspace_lanes
 
 
-@pytest.fixture
-def manager() -> WorkspaceManager:
-    return WorkspaceManager(device=torch.device("cpu"), num_ubatches=1)
+class _SpecConfig:
+    def __init__(self, dspark: bool) -> None:
+        self._dspark = dspark
+
+    def use_dspark(self) -> bool:
+        return self._dspark
 
 
-@pytest.fixture
-def dbo_manager() -> WorkspaceManager:
-    return WorkspaceManager(device=torch.device("cpu"), num_ubatches=2)
+class _VllmConfig:
+    def __init__(self, spec_config: _SpecConfig | None) -> None:
+        self.speculative_config = spec_config
 
 
-def test_get_simultaneous_grows_when_unlocked(manager: WorkspaceManager) -> None:
-    a, b = manager.get_simultaneous(
-        ((16,), torch.float32),
-        ((8,), torch.float32),
-    )
-    assert a.shape == (16,)
-    assert b.shape == (8,)
-    assert a.dtype == torch.float32
-
-
-def test_get_simultaneous_raises_on_locked_undersized(
-    manager: WorkspaceManager,
+@pytest.mark.parametrize(
+    ("use_v2_model_runner", "spec_config", "expected"),
+    [
+        (True, _SpecConfig(True), 2),
+        (False, _SpecConfig(True), 1),
+        (True, _SpecConfig(False), 1),
+        (True, None, 1),
+    ],
+)
+def test_workspace_lane_count_is_dspark_only(
+    use_v2_model_runner: bool,
+    spec_config: _SpecConfig | None,
+    expected: int,
 ) -> None:
-    manager.lock()
-    with pytest.raises(AssertionError, match="Workspace is locked"):
-        manager.get_simultaneous(((1024,), torch.float32))
+    config = cast(VllmConfig, _VllmConfig(spec_config))
+    assert _num_workspace_lanes(config, use_v2_model_runner) == expected
 
 
-def test_get_simultaneous_succeeds_on_locked_when_fits(
-    manager: WorkspaceManager,
-) -> None:
-    manager.get_simultaneous(((1024,), torch.float32))
-    manager.lock()
-    (t,) = manager.get_simultaneous(((128,), torch.float32))
-    assert t.shape == (128,)
-
-
-def test_try_get_simultaneous_returns_none_when_locked_undersized(
-    manager: WorkspaceManager,
-) -> None:
-    """The failure mode from issue #42544: workspace locked at 0 bytes,
-    decode-time allocation requested. Must not raise."""
-    manager.lock()
-    result = manager.try_get_simultaneous(
-        ((24, 4, 8, 257), torch.float32),
-        ((24, 4, 256), torch.bfloat16),
-        ((24, 4), torch.float32),
+def test_workspace_lanes_do_not_alias_and_restore_context(monkeypatch) -> None:
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    manager = workspace.WorkspaceManager(
+        torch.device("cpu"), num_ubatches=2, num_lanes=2
     )
-    assert result is None
+
+    assert manager._current_workspaces == [None, None, None, None]
+
+    (target,) = manager.get_simultaneous(((512,), torch.uint8))
+    with workspace.use_workspace_lane(1):
+        (draft,) = manager.get_simultaneous(((256,), torch.uint8))
+        (draft_reused,) = manager.get_simultaneous(((8,), torch.uint8))
+    (target_reused,) = manager.get_simultaneous(((8,), torch.uint8))
+
+    assert manager._current_workspaces[0].numel() == 512  # type: ignore[union-attr]
+    assert manager._current_workspaces[1].numel() == 256  # type: ignore[union-attr]
+    assert manager._current_workspaces[2:] == [None, None]
+    assert target.data_ptr() != draft.data_ptr()
+    assert draft.data_ptr() == draft_reused.data_ptr()
+    assert target.data_ptr() == target_reused.data_ptr()
 
 
-def test_try_get_simultaneous_returns_views_when_locked_and_fits(
-    manager: WorkspaceManager,
-) -> None:
-    manager.get_simultaneous(
-        ((24, 4, 8, 257), torch.float32),
-        ((24, 4, 256), torch.bfloat16),
-        ((24, 4), torch.float32),
+def test_workspace_lanes_compose_with_ubatches(monkeypatch) -> None:
+    active_ubatch = [0]
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: active_ubatch[0])
+    manager = workspace.WorkspaceManager(
+        torch.device("cpu"), num_ubatches=2, num_lanes=2
     )
-    manager.lock()
-    result = manager.try_get_simultaneous(
-        ((24, 4, 8, 257), torch.float32),
-        ((24, 4, 256), torch.bfloat16),
-        ((24, 4), torch.float32),
-    )
-    assert result is not None
-    mid, out, lse = result
-    assert mid.shape == (24, 4, 8, 257)
-    assert out.shape == (24, 4, 256)
-    assert out.dtype == torch.bfloat16
-    assert lse.shape == (24, 4)
 
-
-def test_try_get_simultaneous_grows_when_unlocked(
-    manager: WorkspaceManager,
-) -> None:
-    result = manager.try_get_simultaneous(((1024,), torch.float32))
-    assert result is not None
-    (t,) = result
-    assert t.shape == (1024,)
-
-
-def test_reserve_sizes_every_ubatch_slot(dbo_manager: WorkspaceManager) -> None:
-    """In DBO setups, reservation at init must hit every ubatch slot —
-    otherwise lock_workspace() snapshots sibling ubatches at 0 bytes and
-    they hit the slow fallback on every forward."""
-    shapes = (
-        ((24, 4, 8, 257), torch.float32),
-        ((24, 4, 256), torch.bfloat16),
-        ((24, 4), torch.float32),
-    )
-    dbo_manager.reserve(*shapes)
-    dbo_manager.lock()
+    pointers = set()
     for ubatch_id in range(2):
-        with patch(
-            "vllm.v1.worker.workspace.dbo_current_ubatch_id", return_value=ubatch_id
-        ):
-            result = dbo_manager.try_get_simultaneous(*shapes)
-            assert result is not None, f"ubatch {ubatch_id} fell back to None"
-            mid, out, lse = result
-            assert mid.shape == (24, 4, 8, 257)
-            assert out.shape == (24, 4, 256)
-            assert lse.shape == (24, 4)
+        active_ubatch[0] = ubatch_id
+        for lane in range(2):
+            with workspace.use_workspace_lane(lane):
+                (buffer,) = manager.get_simultaneous(((16,), torch.uint8))
+                pointers.add(buffer.data_ptr())
+
+    assert len(pointers) == 4
 
 
-def test_get_simultaneous_does_not_size_sibling_ubatch(
-    dbo_manager: WorkspaceManager,
-) -> None:
-    """Conversely, get_simultaneous on the active ubatch must NOT
-    proactively size siblings — that would orphan their views mid-run
-    (the DBO leak warned about in _ensure_workspace_size)."""
-    with patch("vllm.v1.worker.workspace.dbo_current_ubatch_id", return_value=0):
-        dbo_manager.get_simultaneous(((1024,), torch.float32))
-    dbo_manager.lock()
-    with patch("vllm.v1.worker.workspace.dbo_current_ubatch_id", return_value=1):
-        assert dbo_manager.try_get_simultaneous(((128,), torch.float32)) is None
+def test_workspace_lane_validation(monkeypatch) -> None:
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    manager = workspace.WorkspaceManager(torch.device("cpu"), num_lanes=1)
+
+    with (
+        pytest.raises(ValueError, match="non-negative"),
+        workspace.use_workspace_lane(-1),
+    ):
+        pass
+
+    with (
+        workspace.use_workspace_lane(1),
+        pytest.raises(RuntimeError, match="is not configured"),
+    ):
+        manager.get_simultaneous(((1,), torch.uint8))
+
+    with pytest.raises(ValueError, match="at least one"):
+        workspace.WorkspaceManager(torch.device("cpu"), num_lanes=0)
