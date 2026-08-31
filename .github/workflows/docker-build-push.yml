@@ -63,8 +63,29 @@ jobs:
           docker push ${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.sha_date }}
 
       - name: Run PyArmor and push secure image
+        id: pyarmor
         continue-on-error: true
         run: |
-          /workspace/nctu6/autobuild/autobuild-service/pyarmor-tools/run_pyarmor.sh \
+          bash /workspace/nctu6/autobuild/autobuild-service/pyarmor-tools/run_pyarmor.sh \
             "${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.sha_date }}" \
             "nctu6/unieinfra-build-secure"
+
+      - name: Sync image names to Notion
+        if: always()
+        continue-on-error: true
+        env:
+          TORCH_CUDA_ARCH_LIST: "9.0 10.0 11.0 12.0"
+          CUDA_VERSION: "13.0.3"
+        run: |
+          TAG="${{ steps.meta.outputs.sha_date }}"
+          SOURCE_IMAGE="${{ env.DOCKERHUB_REPO }}:${TAG}"
+          PYARMOR_IMAGE="nctu6/unieinfra-build-secure:${TAG}"
+          # "9.0 10.0 11.0 12.0" -> "9,10,11,12"
+          CUDA_ARCH=$(echo "${TORCH_CUDA_ARCH_LIST}" | tr ' ' '\n' | sed 's/\..*//' | paste -sd ',' -)
+          CODE=$(git log -1 --pretty=%s)
+          bash /workspace/nctu6/autobuild/autobuild-service/pyarmor-tools/notion.sh \
+            "${SOURCE_IMAGE}" \
+            "${PYARMOR_IMAGE}" \
+            "${CUDA_ARCH}" \
+            "${CUDA_VERSION}" \
+            "${CODE}"
