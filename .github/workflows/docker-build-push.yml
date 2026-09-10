@@ -57,6 +57,7 @@ jobs:
           cat <<'EOF' | docker build -t ${{ env.DOCKERHUB_REPO }}:latest -
           FROM vllm-base:local
           RUN pip install --no-cache-dir "vllm[audio]" msgpack
+          RUN pip install --no-cache-dir -U torchao
           EOF
           docker tag ${{ env.DOCKERHUB_REPO }}:latest ${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.sha_date }}
           docker push ${{ env.DOCKERHUB_REPO }}:latest

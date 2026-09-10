@@ -205,16 +205,14 @@ impl ModelConfig {
 
     /// Return the effective model vocabulary size, following the same
     /// simplified text-config selection as `model_type`.
-    pub fn vocab_size(&self) -> Result<u32> {
-        if let Some(vocab_size) = self.vocab_size {
-            Ok(vocab_size)
-        } else if let Some(text_config) = self.text_config.as_deref() {
-            text_config.vocab_size()
-        } else {
-            Err(Error::Tokenizer(
-                "the model config does not define `vocab_size`".to_string(),
-            ))
-        }
+    ///
+    /// Composite models (e.g. `Gemma3ForConditionalGeneration`) keep
+    /// `vocab_size` in a nested `text_config` rather than at the top level, so
+    /// we walk into it when the top-level value is absent. Returns `None` when
+    /// no `vocab_size` can be resolved; callers may fall back to the tokenizer
+    /// vocabulary size in that case.
+    pub fn vocab_size(&self) -> Option<u32> {
+        self.vocab_size.or_else(|| self.text_config.as_deref()?.vocab_size())
     }
 
     /// Return the effective model-side EOS token ids, following the same
@@ -402,7 +400,29 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.vocab_size().unwrap(), 151936);
+        assert_eq!(config.vocab_size(), Some(151936));
+    }
+
+    #[test]
+    fn model_config_reads_nested_vocab_size_for_gemma3_composite_config() {
+        let config: ModelConfig = serde_json::from_str(
+            r#"{
+                "architectures": ["Gemma3ForConditionalGeneration"],
+                "model_type": "gemma3",
+                "eos_token_id": [1, 106],
+                "text_config": {
+                    "model_type": "gemma3_text",
+                    "num_hidden_layers": 62,
+                    "vocab_size": 262208
+                },
+                "vision_config": {
+                    "model_type": "siglip_vision_model"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.vocab_size(), Some(262208));
     }
 
     #[test]
@@ -432,11 +452,29 @@ mod tests {
     }
 
     #[test]
-    fn model_config_rejects_missing_vocab_size() {
+    fn model_config_returns_none_when_vocab_size_is_missing() {
         let config: ModelConfig = serde_json::from_str(r#"{}"#).unwrap();
 
-        let error = config.vocab_size().unwrap_err();
-        assert!(error.to_string().contains("does not define `vocab_size`"));
+        assert_eq!(config.vocab_size(), None);
+    }
+
+    #[test]
+    fn model_config_returns_none_when_nested_text_config_omits_vocab_size() {
+        // Trimmed Gemma-3 export whose `text_config` drops `vocab_size`; Python
+        // fills it from model-class defaults while the Rust frontend must fall
+        // back to the tokenizer vocabulary size.
+        let config: ModelConfig = serde_json::from_str(
+            r#"{
+                "model_type": "gemma3",
+                "text_config": {
+                    "model_type": "gemma3_text",
+                    "num_hidden_layers": 62
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.vocab_size(), None);
     }
 
     #[test]

@@ -58,7 +58,24 @@ impl HfTextBackend {
         let tokenizer_config = load_tokenizer_config(files.tokenizer_config_path.as_deref())?;
         let tokenizer = load_tokenizer(&files.tokenizer)?;
         let model_config = load_model_config(files.config_path.as_deref())?;
-        let model_vocab_size = model_config.vocab_size()? as usize;
+        // Some checkpoints ship a trimmed `config.json` that omits `vocab_size`
+        // (both at the top level and in a nested `text_config`, e.g. some
+        // Gemma-3 exports). Python fills this in from model-class defaults; the
+        // Rust frontend has no such defaults, so fall back to the tokenizer
+        // vocabulary size to keep serving these models.
+        let model_vocab_size = match model_config.vocab_size() {
+            Some(vocab_size) => vocab_size as usize,
+            None => {
+                let tokenizer_vocab_size = tokenizer.vocab_size();
+                info!(
+                    model_id,
+                    tokenizer_vocab_size,
+                    "model config does not define `vocab_size`; \
+                     falling back to tokenizer vocabulary size"
+                );
+                tokenizer_vocab_size
+            }
+        };
         let generation_config = load_generation_config(files.generation_config_path.as_deref())?;
         let (primary_eos_token_id, extra_eos_token_ids) = resolve_eos_token_ids(
             &tokenizer_config,
