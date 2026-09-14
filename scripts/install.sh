@@ -32,6 +32,11 @@ PYTHON_BIN="${PYTHON_BIN:-$(default_python_bin)}"
 INSTALL_LOG="${INSTALL_LOG:-install.log}"
 AUTO_INSTALL_CUDA_DEV_HEADERS="${AUTO_INSTALL_CUDA_DEV_HEADERS:-1}"
 AUTO_INSTALL_SYSTEM_DEPS="${AUTO_INSTALL_SYSTEM_DEPS:-1}"
+# Minimum GNU C++ compiler that ships a usable libstdc++ <format> header.
+# Sources such as deepselect (csrc/api.cpp) include <format>, which requires
+# GCC >= 13; GCC 11/12 fail with "fatal error: format: No such file".
+MIN_GXX_MAJOR="${MIN_GXX_MAJOR:-13}"
+AUTO_INSTALL_MODERN_GXX="${AUTO_INSTALL_MODERN_GXX:-1}"
 UV_TORCH_BACKEND="${UV_TORCH_BACKEND:-${TORCH_BACKEND:-auto}}"
 LOG_FLASH_ATTN_BUILD="${LOG_FLASH_ATTN_BUILD:-1}"
 REFRESH_DEEPGEMM="${REFRESH_DEEPGEMM:-1}"
@@ -727,6 +732,293 @@ detect_package_manager() {
     return 1
 }
 
+gxx_major_version() {
+    local compiler="$1"
+    local major=""
+
+    if [[ -z "${compiler}" ]] || ! command -v "${compiler}" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    major="$("${compiler}" -dumpfullversion -dumpversion 2>/dev/null | head -n1 | cut -d. -f1)"
+    if [[ "${major}" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "${major}"
+        return 0
+    fi
+
+    return 1
+}
+
+gxx_supports_format() {
+    local compiler="$1"
+
+    command -v "${compiler}" >/dev/null 2>&1 || return 1
+
+    printf '#include <format>\nint main(){return 0;}\n' \
+        | "${compiler}" -std=c++20 -x c++ - -c -o /dev/null >/dev/null 2>&1
+}
+
+# Locate a g++ whose libstdc++ provides <format> (GCC >= MIN_GXX_MAJOR).
+# Prints the C++ compiler path on success.
+find_modern_gxx() {
+    local candidate
+    local major
+    local -a candidates=()
+
+    if [[ -n "${CXX:-}" ]]; then
+        candidates+=("${CXX}")
+    fi
+    candidates+=(g++)
+
+    local v
+    for v in 15 14 13; do
+        if (( v >= MIN_GXX_MAJOR )); then
+            candidates+=("g++-${v}")
+        fi
+    done
+
+    for candidate in "${candidates[@]}"; do
+        command -v "${candidate}" >/dev/null 2>&1 || continue
+        if major="$(gxx_major_version "${candidate}")" \
+            && (( major >= MIN_GXX_MAJOR )) \
+            && gxx_supports_format "${candidate}"; then
+            command -v "${candidate}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+gcc_sibling_for_gxx() {
+    local gxx_path="$1"
+    local gcc_path="${gxx_path/g++/gcc}"
+
+    if [[ "${gcc_path}" != "${gxx_path}" ]] && command -v "${gcc_path}" >/dev/null 2>&1; then
+        printf '%s\n' "${gcc_path}"
+        return 0
+    fi
+
+    if command -v gcc >/dev/null 2>&1; then
+        command -v gcc
+        return 0
+    fi
+
+    return 1
+}
+
+# Add the ubuntu-toolchain-r/test PPA without relying on add-apt-repository,
+# which breaks when python3 resolves to a venv missing the apt_pkg extension
+# (ModuleNotFoundError: No module named 'apt_pkg'). Writes the apt source and
+# key files directly. Falls back to add-apt-repository only if the direct
+# method cannot fetch the signing key.
+add_ubuntu_toolchain_ppa() {
+    local -a prefix=("$@")
+    local codename=""
+    local list_file="/etc/apt/sources.list.d/ubuntu-toolchain-r-test.list"
+    local keyring="/etc/apt/keyrings/ubuntu-toolchain-r.gpg"
+    # LP: ~ubuntu-toolchain-r signing key (0x1E9377A2BA9EF27F).
+    local key_fpr="60C317803A41BA51845E371A1E9377A2BA9EF27F"
+
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        codename="$(. /etc/os-release && printf '%s' "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}")"
+    fi
+
+    if [[ -z "${codename}" ]]; then
+        echo "warning: could not determine Ubuntu codename for the toolchain PPA." >&2
+        return 1
+    fi
+
+    if ! command -v gpg >/dev/null 2>&1; then
+        "${prefix[@]}" apt-get install -y gnupg ca-certificates curl || true
+    fi
+
+    "${prefix[@]}" install -d -m 0755 /etc/apt/keyrings || true
+
+    local fetched=1
+    if command -v gpg >/dev/null 2>&1; then
+        local tmp_key="/tmp/ubuntu-toolchain-r.key"
+        if command -v curl >/dev/null 2>&1 && \
+            curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${key_fpr}" -o "${tmp_key}"; then
+            if "${prefix[@]}" gpg --batch --yes --dearmor -o "${keyring}" "${tmp_key}"; then
+                fetched=0
+            fi
+        fi
+        rm -f "${tmp_key}"
+
+        if (( fetched )); then
+            if "${prefix[@]}" gpg --no-default-keyring --keyring "${keyring}" \
+                --keyserver keyserver.ubuntu.com --recv-keys "${key_fpr}"; then
+                fetched=0
+            fi
+        fi
+    fi
+
+    if (( fetched )); then
+        echo "warning: could not import the toolchain PPA key directly; trying add-apt-repository." >&2
+        if ! command -v add-apt-repository >/dev/null 2>&1; then
+            "${prefix[@]}" apt-get install -y software-properties-common || true
+        fi
+        if command -v add-apt-repository >/dev/null 2>&1; then
+            "${prefix[@]}" add-apt-repository -y ppa:ubuntu-toolchain-r/test && return 0
+        fi
+        return 1
+    fi
+
+    printf 'deb [signed-by=%s] https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu %s main\n' \
+        "${keyring}" "${codename}" \
+        | "${prefix[@]}" tee "${list_file}" >/dev/null
+
+    return 0
+}
+
+install_modern_gxx() {
+    local package_manager="$1"
+    local -a prefix=("${@:2}")
+
+    if [[ ! "${AUTO_INSTALL_MODERN_GXX}" =~ ^(1|true)$ ]]; then
+        return 1
+    fi
+
+    echo "Attempting to install g++-${MIN_GXX_MAJOR} for C++20 <format> support via ${package_manager}." >&2
+    case "${package_manager}" in
+        apt-get)
+            "${prefix[@]}" apt-get update || true
+            if "${prefix[@]}" apt-get install -y "g++-${MIN_GXX_MAJOR}" "gcc-${MIN_GXX_MAJOR}"; then
+                return 0
+            fi
+            # Older Ubuntu releases (e.g. 22.04) do not ship g++-13 in the default
+            # repos; the ubuntu-toolchain-r/test PPA provides it.
+            echo "g++-${MIN_GXX_MAJOR} not in default apt repos; adding ubuntu-toolchain-r/test PPA." >&2
+            add_ubuntu_toolchain_ppa "${prefix[@]}" || true
+            "${prefix[@]}" apt-get update || true
+            "${prefix[@]}" apt-get install -y "g++-${MIN_GXX_MAJOR}" "gcc-${MIN_GXX_MAJOR}" || return 1
+            ;;
+        dnf|microdnf|yum)
+            "${prefix[@]}" "${package_manager}" install -y gcc-toolset-"${MIN_GXX_MAJOR}" || \
+                "${prefix[@]}" "${package_manager}" install -y gcc-c++ || return 1
+            ;;
+        zypper)
+            "${prefix[@]}" zypper --non-interactive install "gcc${MIN_GXX_MAJOR}-c++" || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+# Ensure the build uses a C++ compiler new enough for <format>. Selects (and
+# optionally installs) a modern g++, then exports CC/CXX and pins the CUDA host
+# compiler so nvcc uses the same toolchain.
+select_build_compiler() {
+    local gxx=""
+    local gcc=""
+    local package_manager=""
+    local -a prefix=()
+
+    if [[ -n "${CMAKE_CUDA_HOST_COMPILER:-}" ]] || [[ -n "${CUDAHOSTCXX:-}" ]]; then
+        return 0
+    fi
+
+    if gxx="$(find_modern_gxx)"; then
+        :
+    else
+        local default_major=""
+        default_major="$(gxx_major_version g++ 2>/dev/null || echo "unknown")"
+        echo "warning: no C++ compiler with C++20 <format> support (GCC >= ${MIN_GXX_MAJOR}) found; default g++ is ${default_major}." >&2
+
+        if [[ "${AUTO_INSTALL_SYSTEM_DEPS}" =~ ^(0|false)$ ]] || [[ ! "${AUTO_INSTALL_MODERN_GXX}" =~ ^(1|true)$ ]]; then
+            echo "warning: automatic modern-g++ installation is disabled; the build may fail on sources that include <format>." >&2
+            return 0
+        fi
+
+        if ! package_manager="$(detect_package_manager)"; then
+            echo "warning: no supported package manager found to install a modern g++." >&2
+            return 0
+        fi
+
+        if [[ "$(id -u)" -ne 0 ]]; then
+            if command -v sudo >/dev/null 2>&1; then
+                prefix=(sudo)
+            else
+                echo "warning: installing a modern g++ requires root or sudo." >&2
+                return 0
+            fi
+        fi
+
+        if install_modern_gxx "${package_manager}" "${prefix[@]}" && gxx="$(find_modern_gxx)"; then
+            :
+        else
+            echo "warning: could not provide a g++ with <format> support; continuing with the default compiler." >&2
+            return 0
+        fi
+    fi
+
+    gcc="$(gcc_sibling_for_gxx "${gxx}" || true)"
+
+    export CXX="${gxx}"
+    [[ -n "${gcc}" ]] && export CC="${gcc}"
+    export CUDAHOSTCXX="${gxx}"
+
+    append_cmake_arg "-DCMAKE_CXX_COMPILER=${gxx}"
+    [[ -n "${gcc}" ]] && append_cmake_arg "-DCMAKE_C_COMPILER=${gcc}"
+    append_cmake_arg "-DCMAKE_CUDA_HOST_COMPILER=${gxx}"
+
+    clear_stale_cmake_compiler_cache "${gxx}"
+
+    echo "Using C++ compiler with <format> support: ${gxx} (major $(gxx_major_version "${gxx}" 2>/dev/null || echo '?'))." >&2
+    return 0
+}
+
+# CMake caches the C/C++/CUDA host compiler at first configure. If a previous
+# run configured with a different (older) compiler, reconfiguring will not pick
+# up the newly selected one, so purge the stale build/subbuild trees.
+clear_stale_cmake_compiler_cache() {
+    local desired_cxx="$1"
+    local desired_resolved=""
+    local cache
+    local cached_cxx=""
+    local -a caches=()
+    local stale=0
+
+    desired_resolved="$(command -v "${desired_cxx}" 2>/dev/null || printf '%s' "${desired_cxx}")"
+
+    while IFS= read -r cache; do
+        [[ -n "${cache}" ]] && caches+=("${cache}")
+    done < <(find .deps build -name CMakeCache.txt 2>/dev/null)
+
+    for cache in "${caches[@]}"; do
+        cached_cxx="$(sed -nE 's/^CMAKE_CXX_COMPILER:[^=]*=(.*)$/\1/p' "${cache}" | head -n1)"
+        if [[ -n "${cached_cxx}" && "${cached_cxx}" != "${desired_resolved}" && "${cached_cxx}" != "${desired_cxx}" ]]; then
+            stale=1
+            break
+        fi
+    done
+
+    if (( ! stale )); then
+        return 0
+    fi
+
+    echo "Detected CMake caches configured with a different compiler; clearing stale build trees so ${desired_cxx} is used." >&2
+    local artifact
+    for artifact in \
+        .deps/deepselect-build .deps/deepselect-subbuild \
+        .deps/cutlass-build .deps/cutlass-subbuild \
+        .deps/triton_kernels-build .deps/triton_kernels-subbuild \
+        .deps/deepgemm-build .deps/deepgemm-subbuild \
+        .deps/fmha_sm100-build .deps/fmha_sm100-subbuild \
+        .deps/flashmla-build .deps/flashmla-subbuild \
+        build; do
+        if [[ -e "${artifact}" ]]; then
+            echo "Removing stale CMake artifact: ${artifact}" >&2
+            rm -rf -- "${artifact}"
+        fi
+    done
+}
+
 install_system_build_dependencies() {
     local package_manager=""
     local -a prefix=()
@@ -761,6 +1053,9 @@ install_system_build_dependencies() {
                 return 0
             fi
             "${prefix[@]}" apt-get install -y git build-essential ca-certificates curl || true
+            if [[ "${AUTO_INSTALL_MODERN_GXX}" =~ ^(1|true)$ ]]; then
+                "${prefix[@]}" apt-get install -y "g++-${MIN_GXX_MAJOR}" "gcc-${MIN_GXX_MAJOR}" || true
+            fi
             ;;
         dnf)
             "${prefix[@]}" dnf install -y git gcc gcc-c++ make ca-certificates curl || true
@@ -1097,6 +1392,7 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
 fi
 
 install_system_build_dependencies
+select_build_compiler
 if ! command -v git >/dev/null 2>&1; then
     echo "error: git is required so setuptools-scm can determine the vLLM version." >&2
     echo "Install git in the container, or set VLLM_VERSION_OVERRIDE to a valid version string and rerun." >&2
