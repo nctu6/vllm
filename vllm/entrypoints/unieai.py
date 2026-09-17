@@ -25,9 +25,6 @@ except ImportError:
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-from vllm.entrypoints.openai.api_server import run_server
-from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
-# from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
