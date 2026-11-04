@@ -35,7 +35,7 @@ jobs:
       - name: Build and push
         uses: docker/bake-action@v6
         env:
-          TORCH_CUDA_ARCH_LIST: "9.0 10.0 11.0 12.0"
+          TORCH_CUDA_ARCH_LIST: "8.0 8.6 8.9 9.0 10.0 11.0 12.0"
           MAX_JOBS: "64"
           NVCC_THREADS: "4"
         with:
@@ -75,14 +75,14 @@ jobs:
         if: always()
         continue-on-error: true
         env:
-          TORCH_CUDA_ARCH_LIST: "9.0 10.0 11.0 12.0"
+          TORCH_CUDA_ARCH_LIST: "8.0 8.6 8.9 9.0 10.0 11.0 12.0"
           CUDA_VERSION: "13.0.3"
         run: |
           TAG="${{ steps.meta.outputs.sha_date }}"
           SOURCE_IMAGE="${{ env.DOCKERHUB_REPO }}:${TAG}"
           PYARMOR_IMAGE="nctu6/unieinfra-build-secure:${TAG}"
-          # "9.0 10.0 11.0 12.0" -> "9,10,11,12"
-          CUDA_ARCH=$(echo "${TORCH_CUDA_ARCH_LIST}" | tr ' ' '\n' | sed 's/\..*//' | paste -sd ',' -)
+          # "8.0 8.6 8.9 9.0 10.0 11.0 12.0" -> "8,9,10,11,12"
+          CUDA_ARCH=$(echo "${TORCH_CUDA_ARCH_LIST}" | tr ' ' '\n' | sed 's/\..*//' | awk '!seen[$0]++' | paste -sd ',' -)
           CODE=$(git log -1 --pretty=%s)
           bash /workspace/nctu6/autobuild/autobuild-service/pyarmor-tools/notion.sh \
             "${SOURCE_IMAGE}" \
